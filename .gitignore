@@ -9,5 +9,5 @@ terraform.tfstate
 metal-amd64.iso
 sha256sum.txt
 
-.envrc
-.env
+*.envrc*
+*.env*
