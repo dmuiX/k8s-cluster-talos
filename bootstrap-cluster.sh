@@ -155,7 +155,7 @@ fi
 # Generate Talos configuration files for your cluster
 # Pick an endpoint IP in the network but not used by any nodes, for example 192.168.121.100.
 
-if [ -f "controlplane.yaml" ]; then
+if [ -f "$CLUSTER_DIR/controlplane.yaml" ]; then
     echo "Generating Talos configuration files..."
     talosctl gen config my-cluster https://192.168.1.244:6443 --install-disk /dev/vda
 fi
@@ -165,8 +165,8 @@ fi
 # #Edit controlplane.yaml to add the virtual IP you picked to a network interface under .machine.network.interfaces, for example:
 
 #find out ip adresses of the vms
-VM_IPS=$(virsh net-dhcp-leases --network vagrant-libvirt | awk '{print $5}')
-echo "VM IPs: $VM_IPS"
+VM_IPs=$(virsh net-dhcp-leases --network vagrant-libvirt | awk '{print $5}')
+echo "VM IPs: $VM_IPs"
 
 #set the ip adresses of the nodes.yaml in the machine section of controlplane.yaml and worker.yaml
 
