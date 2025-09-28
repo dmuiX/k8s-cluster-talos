@@ -1,0 +1,79 @@
+<domain type="kvm">
+  <name>__VM_NAME__</name>
+  <uuid>3760fccc-1897-4cbc-b99d-7145c4b34694</uuid>
+  <description>K8S cluster __VM_NAME__</description>
+  <memory unit="KiB">__MEMORY_KiB__</memory>
+  <currentMemory unit="KiB">__MEMORY_KiB__</currentMemory>
+  <vcpu placement="static">__VCPUS__</vcpu>
+  <os>
+    <type arch="x86_64" machine="pc-i440fx-10.0">hvm</type>
+    <bootmenu enable="no"/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <cpu mode="host-passthrough" check="none" migratable="on"/>
+  <clock offset="utc"/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="raw"/>
+      <source file="__DISK_PATH__'"/>
+      <target dev="vda" bus="virtio"/>
+      <boot order="2"/>
+      <alias name="ua-disk-volume-0"/>
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x03" function="0x0"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="__ISO_PATH__"/>
+      <target dev="hda" bus="ide"/>
+      <readonly/>
+      <boot order="1"/>
+      <address type="drive" controller="0" bus="0" target="0" unit="0"/>
+    </disk>
+    <controller type="usb" index="0" model="piix3-uhci">
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x01" function="0x2"/>
+    </controller>
+    <controller type="pci" index="0" model="pci-root"/>
+    <controller type="ide" index="0">
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x01" function="0x1"/>
+    </controller>
+    <interface type="bridge">
+      <mac address="52:54:00:8d:32:39"/>
+      <source bridge="__BRIDGE_NAME__"/>
+      <model type="virtio"/>
+      <driver iommu="off"/>
+      <alias name="ua-net-0"/>
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x05" function="0x0"/>
+    </interface>
+    <serial type="file">
+      <source path="__SERIAL_LOG_PATH__" append="on"/>
+      <target type="isa-serial" port="0">
+        <model name="isa-serial"/>
+      </target>
+    </serial>
+    <console type="file">
+      <source path="__CONSOLE_LOG_PATH__" append="on"/>
+      <target type="serial" port="0"/>
+    </console>
+    <input type="mouse" bus="ps2"/>
+    <input type="keyboard" bus="ps2"/>
+    <graphics type="vnc" port="-1" autoport="yes" websocket="-1" listen="127.0.0.1" keymap="en-us">
+      <listen type="address" address="127.0.0.1"/>
+    </graphics>
+    <audio id="1" type="none"/>
+    <video>
+      <model type="virtio" heads="1" primary="yes"/>
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x02" function="0x0"/>
+    </video>
+    <memballoon model="virtio">
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x04" function="0x0"/>
+    </memballoon>
+  </devices>
+</domain>
