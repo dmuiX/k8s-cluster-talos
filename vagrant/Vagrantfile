@@ -1,0 +1,37 @@
+REQUIRED_PLUGINS = %w(vagrant-libvirt vagrant-qemu)
+
+exit unless REQUIRED_PLUGINS.all? do |plugin|
+  Vagrant.has_plugin?(plugin) || (
+    puts "The #{plugin} plugin is required. Please install it with:"
+    puts "$ vagrant plugin install #{plugin}"
+    false
+  )
+end
+
+require 'yaml'
+
+nodes = YAML.load_file('../nodes.yaml')["nodes"]
+# puts "ISO Path: #{File.expand_path('./metal-amd64.iso')}"
+
+Vagrant.configure("2") do |config|
+  # create VMs for each node
+  nodes.each do |node|
+    config.vm.define node['name'] do |nodeConfig|
+      # nodeConfig.vm.network :public_network, :dev => "br0", :type => "bridge", :ip => node['ip']
+      nodeConfig.vm.provider :libvirt do |domain|
+        domain.driver = 'kvm'
+        domain.cpus = node['vcpus']
+        domain.memory = node['memory_mib']
+        domain.nested = true
+        domain.cpu_mode = 'host-passthrough'
+        domain.storage :file, :device => :cdrom, :path => "#{File.expand_path('./metal-amd64.iso')}"
+        domain.serial :type => :file , :source => {:path => "./#{node['name']}-serial.log"}
+        domain.storage :file, :size => '10G', :discard => 'unmap'
+        # domain.uri = 'qemu:///system'
+        domain.boot 'hd'
+        domain.boot 'cdrom'
+        # domain.boot_order = ['cdrom', 'hd']
+      end
+    end
+  end
+end

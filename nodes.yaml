@@ -1,0 +1,28 @@
+nodes:
+  - name: "haproxy"
+    ip: "192.168.1.20"
+    gateway: "192.168.1.1"
+    nameservers:
+      - "192.168.1.253"
+      - "192.168.1.1"
+    vcpus: 1
+    memory_mib: 2048
+    role: "load-balancer"
+  - name: "control-node-1"
+    ip: "192.168.1.21"
+    gateway: "192.168.1.1"
+    nameservers:
+      - "192.168.1.253"
+      - "192.168.1.1"
+    vcpus: 2
+    memory_mib: 8192
+    role: "control-node"
+  - name: "control-node-2"
+    ip: "192.168.1.22"
+    gateway: "192.168.1.1"
+    nameservers:
+      - "192.168.1.253"
+      - "192.168.1.1"
+    vcpus: 2
+    memory_mib: 8192
+    role: "control-node"

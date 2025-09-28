@@ -1,0 +1,12 @@
+terraform.tfstate
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+*.tfstate
+*.tfstate.backup
+
+*.vagrant*
+metal-amd64.iso
+sha256sum.txt
+
+.envrc
