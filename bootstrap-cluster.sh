@@ -15,7 +15,7 @@
 #   - .envrc file for direnv and manual terraform deployment (optional)
 #   - nodes.yaml file with node definitions
 #     Example: 
-#     - name: Unique node name (e.g., control-node-1)
+#     - name: Unique node name (e.g., cqontrol-node-1)
 #     - role: "control-node", "worker-node", or "haproxy"
 #     - ip: Static IP address for the node
 #     - mac: MAC address for the node (optional, auto-generated if missing)
@@ -591,9 +591,16 @@ generate_patch_files_by_role() {
         # This disables DHCP and sets static IP, routes, nameservers, timezone, and NTP servers
         # Also configures for Cilium: no default CNI, kube-proxy disabled (Cilium replaces it)
         # Sets hostname to node name for proper Kubernetes node identification
-        # Uses diskSelector with system=true for automatic system disk detection
+        # Adds appropriate node role labels
+        
+        # Set role-specific environment variable for yq
+        if [ "$role" == "control-node" ]; then
+            export NODE_ROLE_LABEL=""  # Control plane nodes get their role automatically
+        else
+            export NODE_ROLE_LABEL="worker"
+        fi
+        
         yq e -n '
-          .machine.install.diskSelector.system = true |
           .machine.network.hostname = env(name) |
           .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
           .machine.network.interfaces[0].dhcp = false |
@@ -608,6 +615,7 @@ generate_patch_files_by_role() {
           .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
           .machine.kernel.modules[0].name = "br_netfilter" |
           .machine.kernel.modules[1].name = "overlay" |
+          (if env(NODE_ROLE_LABEL) != "" then .machine.nodeLabels."node-role.kubernetes.io/worker" = env(NODE_ROLE_LABEL) else . end) |
           .cluster.network.cni.name = "none" |
           .cluster.proxy.disabled = true |
           .cluster.allowSchedulingOnControlPlanes = true
@@ -1327,6 +1335,79 @@ if [ $RETRY -eq $MAX_RETRY ]; then
 fi
 
 # ==============================================================================
+# Step 10: Install Cilium CNI with KubePrism
+# ==============================================================================
+# Install Cilium using Talos's built-in KubePrism load balancer
+# This avoids certificate issues and provides optimal performance
+# ==============================================================================
+
+echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
+
+# Check if cilium CLI is available
+if ! command -v cilium &> /dev/null; then
+    echo "Installing Cilium CLI..."
+    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    CLI_ARCH=amd64
+    if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+    curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+    sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+    $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+    rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+    echo "✓ Cilium CLI installed"
+fi
+
+# kubeprism! port 7445
+# Install Cilium with KubePrism configuration
+echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
+cilium install \
+    --set kubeProxyReplacement=true \
+    --set k8sServiceHost=127.0.0.1 \
+    --set k8sServicePort=7445 \ 
+    --set envoy.enabled=true \
+    --set envoyConfig.enabled=true \
+    --set envoyConfig.secretsNamespace.name=cilium \
+    --set gatewayAPI.enabled=true \
+    --set gatewayAPI.secretsNamespace.name=cilium \
+    --set sysctlfix.enabled=false \
+    --set ingressController.enabled=false \
+    --set ingressController.loadbalancerMode=dedicated \
+    --set externalIPs.enabled=true \
+    --set l2announcements.enabled=true \
+    --set l2podAnnouncements.enabled=true \
+    --set l2podAnnouncements.interface=eth1 \
+    --set loadBalancer.l7.backend=envoy \
+    --set debug.enabled=true \
+    --set debug.verbose=flow \
+    --set hubble.relay.enabled=true \
+    --set hubble.ui.enabled=true
+
+
+# Wait for Cilium to be ready
+echo "Waiting for Cilium to be ready..."
+RETRY=0
+MAX_RETRY=30
+while [ $RETRY -lt $MAX_RETRY ]; do
+    if cilium status --wait=false 2>/dev/null | grep -q "Cilium:.*OK"; then
+        echo "✓ Cilium is ready"
+        break
+    fi
+    RETRY=$((RETRY+1))
+    if [ $RETRY -lt $MAX_RETRY ]; then
+        echo -n "."
+        sleep 10
+    fi
+done
+
+if [ $RETRY -eq $MAX_RETRY ]; then
+    echo "\n⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
+    echo "  Check status with: cilium status"
+else
+    # Show Cilium status
+    echo ""
+    cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
+fi
+
+# ==============================================================================
 # Cleanup temporary files
 # ==============================================================================
 
@@ -1354,11 +1435,13 @@ echo "📋 Cluster Summary:"
 echo "   • Control nodes: ${CONTROL_NODE_COUNT}"
 echo "   • Worker nodes: ${WORKER_NODE_COUNT}"
 echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
+echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
 echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "To verify your cluster, run:"
 echo "  kubectl get nodes"
+echo "  cilium status"
 echo ""
 
 # ==============================================================================
