@@ -55,6 +55,9 @@ OPTIONS:
     --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
     --no-custom-iso         Use standard ISO instead of custom (with extensions)
     --skip-terraform        Skip VM creation (use existing VMs)
+    --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
+    --skip-cilium-installation  Skip Cilium CNI installation
+    --skip-argocd-installation  Skip ArgoCD installation
     --debug                 Enable verbose bash debug mode (set -x)
     --no-cleanup            Disable automatic terraform destroy on error
     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
@@ -220,6 +223,9 @@ fi
 
 SKIP_TERRAFORM=false
 SKIP_ISO_DOWNLOAD=false
+SKIP_BOOTSTRAP=false
+SKIP_CILIUM_INSTALLATION=false
+SKIP_ARGOCD_INSTALLATION=false
 USE_CUSTOM_ISO=true
 DEBUG=false
 
@@ -238,6 +244,18 @@ for arg in "$@"; do
             ;;
         --skip-terraform)
             SKIP_TERRAFORM=true
+            shift
+            ;;
+        --skip-bootstrap)
+            SKIP_BOOTSTRAP=true
+            shift
+            ;;
+        --skip-cilium-installation)
+            SKIP_CILIUM_INSTALLATION=true
+            shift
+            ;;
+        --skip-argocd-installation)
+            SKIP_ARGOCD_INSTALLATION=true
             shift
             ;;
         --debug)
@@ -579,7 +597,7 @@ generate_patch_files_by_role() {
         nameservers=$(echo "$node_json" | jq -r '.nameservers | join(",")')
         
         local patch_file="./node-configs/${name}-network-patch.yaml"
-        echo "  ✓ ${name} patch → ${patch_file}"
+        echo "  ✓ ${name} network patch → ${patch_file}"
         
         # Export variables for yq to use in YAML generation
         export IP="$ip"
@@ -600,38 +618,81 @@ generate_patch_files_by_role() {
             export NODE_ROLE_LABEL="worker"
         fi
         
-        yq e -n '
-          .machine.network.hostname = env(name) |
-          .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
-          .machine.network.interfaces[0].dhcp = false |
-          .machine.network.interfaces[0].addresses = [env(IP) + "/24"] |
-          .machine.network.interfaces[0].routes = [{"network": "0.0.0.0/0", "gateway": env(GATEWAY)}] |
-          .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
-          .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
-          .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
-          .machine.kubelet.clusterDNS = ["169.254.2.53", "10.96.0.10"] |
-          .machine.sysctls."net.ipv4.ip_forward" = "1" |
-          .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
-          .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
-          .machine.kernel.modules[0].name = "br_netfilter" |
-          .machine.kernel.modules[1].name = "overlay" |
-          (if env(NODE_ROLE_LABEL) != "" then .machine.nodeLabels."node-role.kubernetes.io/worker" = env(NODE_ROLE_LABEL) else . end) |
-          .cluster.network.cni.name = "none" |
-          .cluster.proxy.disabled = true |
-          .cluster.allowSchedulingOnControlPlanes = true
-        ' > "$patch_file"        # Apply patch to base config to create node-specific config
+        # Generate network patch based on role
         if [ "$role" == "control-node" ]; then
-            talosctl machineconfig patch controlplane.yaml --patch @"$patch_file" --output $name-patched.yaml
+            yq e -n '
+              .machine.network.hostname = env(name) |
+              .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
+              .machine.network.interfaces[0].dhcp = false |
+              .machine.network.interfaces[0].addresses = [env(IP) + "/24"] |
+              .machine.network.interfaces[0].routes = [{"network": "0.0.0.0/0", "gateway": env(GATEWAY)}] |
+              .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
+              .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
+              .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
+              .machine.kubelet.clusterDNS = ["169.254.2.53", "10.96.0.10"] |
+              .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
+              .machine.sysctls."net.ipv4.ip_forward" = "1" |
+              .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
+              .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
+              .machine.kernel.modules[0].name = "br_netfilter" |
+              .machine.kernel.modules[1].name = "overlay" |
+              .cluster.apiServer.admissionControl[0].name = "PodSecurity" |
+              .cluster.apiServer.admissionControl[0].configuration.apiVersion = "pod-security.admission.config.k8s.io/v1" |
+              .cluster.apiServer.admissionControl[0].configuration.kind = "PodSecurityConfiguration" |
+              .cluster.apiServer.admissionControl[0].configuration.defaults.enforce = "baseline" |
+              .cluster.apiServer.admissionControl[0].configuration.defaults."enforce-version" = "latest" |
+              .cluster.apiServer.admissionControl[0].configuration.defaults.audit = "restricted" |
+              .cluster.apiServer.admissionControl[0].configuration.defaults."audit-version" = "latest" |
+              .cluster.apiServer.admissionControl[0].configuration.defaults.warn = "restricted" |
+              .cluster.apiServer.admissionControl[0].configuration.defaults."warn-version" = "latest" |
+              .cluster.apiServer.admissionControl[0].configuration.exemptions.usernames = [] |
+              .cluster.apiServer.admissionControl[0].configuration.exemptions.runtimeClasses = [] |
+              .cluster.apiServer.admissionControl[0].configuration.exemptions.namespaces = ["kube-system", "cilium"] |
+              .cluster.network.cni.name = "none" |
+              .cluster.proxy.disabled = true |
+              .cluster.allowSchedulingOnControlPlanes = true
+            ' > "$patch_file"
+        else
+            yq e -n '
+              .machine.network.hostname = env(name) |
+              .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
+              .machine.network.interfaces[0].dhcp = false |
+              .machine.network.interfaces[0].addresses = [env(IP) + "/24"] |
+              .machine.network.interfaces[0].routes = [{"network": "0.0.0.0/0", "gateway": env(GATEWAY)}] |
+              .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
+              .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
+              .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
+              .machine.kubelet.clusterDNS = ["169.254.2.53", "10.96.0.10"] |
+              .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
+              .machine.sysctls."net.ipv4.ip_forward" = "1" |
+              .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
+              .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
+              .machine.kernel.modules[0].name = "br_netfilter" |
+              .machine.kernel.modules[1].name = "overlay" |
+              .machine.nodeLabels."node-role.kubernetes.io/worker" = "worker" |
+              .cluster.network.cni.name = "none" |
+              .cluster.proxy.disabled = true |
+              .cluster.allowSchedulingOnControlPlanes = true
+            ' > "$patch_file"
         fi
-        if [ "$role" == "worker-node" ]; then
-            talosctl machineconfig patch worker.yaml --patch @"$patch_file" --output $name-patched.yaml
+        
+        # Determine base config file based on role
+        if [ "$role" == "control-node" ]; then
+            local base_config="controlplane.yaml"
+        else
+            local base_config="worker.yaml"
         fi
+        
+        # Apply network patch to base config to create final node-specific config
+        talosctl machineconfig patch "$base_config" --patch @"$patch_file" --output $name-patched.yaml
     done
 }
 
 # ==============================================================================
 # Main Script Execution
 # ==============================================================================
+
+if [ "$SKIP_BOOTSTRAP" = false ]; then
 
 echo "==> Step 2a: Performing pre-flight checks..."
 
@@ -703,11 +764,29 @@ echo "Kubernetes endpoint will be: ${K8S_ENDPOINT}"
 
 
 echo -e "\n==> Step 3c: Generating machine configurations..."
-# Always regenerate to ensure configs match current secrets and settings
-rm -f controlplane.yaml worker.yaml 2>/dev/null
-talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
-echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
 
+# Check if configs already exist
+if [ -f "controlplane.yaml" ] || [ -f "worker.yaml" ]; then
+    echo "⚠ Warning: Machine configurations already exist!"
+    echo "  This will regenerate configs and may break access to existing cluster."
+    read -p "Do you want to overwrite them? (yes/no): " -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        echo "Skipping config generation. Using existing configs."
+    else
+        echo "Regenerating configs..."
+        rm -f controlplane.yaml worker.yaml 2>/dev/null
+        talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
+        echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
+    fi
+else
+    # First time generation
+    talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
+    echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
+fi
+
+# Close the skip-bootstrap conditional temporarily - reopen for Steps 6-7
+fi
 
 # ==============================================================================
 # Step 4: Wait for VMs to Boot from ISO
@@ -719,11 +798,26 @@ echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $
 #   - Static IPs are NOT configured yet (they're in the machine config)
 # ==============================================================================
 
-echo -e "\n==> Step 4: Waiting for Talos nodes to boot from ISO..."
-echo "Nodes will boot with DHCP IPs first, then we'll apply static IP configs."
-echo "Actively checking for booted nodes..."
-
+# Always run Step 5 to generate patches (useful for reference even with skip-bootstrap)
+echo -e "\n==> Step 4-5: Generating node-specific configurations..."
 cd "$CLUSTER_DIR"
+mkdir -p ./node-configs
+CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
+WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
+echo "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
+
+# Use the new helper function to create patch files.
+generate_patch_files_by_role "control-node"
+generate_patch_files_by_role "worker-node"
+
+# Re-open skip-bootstrap conditional for Steps 6-7
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+
+echo -e "\n==> Continuing with node installation..."
+
+
+# ==============================================================================
+# Step 6: Discover Dynamic IPs and Apply Configurations
 
 # ==============================================================================
 # Step 5: Create Node-Specific Patched Configs
@@ -1150,6 +1244,28 @@ fi
 
 echo "✓ Control plane is ready. Workers will join after bootstrap."
 
+# Close the skip-bootstrap conditional that started at Step 2
+else
+    echo -e "\n==> Steps 2-7: Skipped (--skip-bootstrap enabled)"
+    echo "Assuming cluster VMs are already configured and running."
+    
+    # Still need to set up essential variables for later steps
+    cd "${CLUSTER_DIR}"
+    
+    # Get first control plane IP for kubeconfig retrieval
+    set +o pipefail
+    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+    set -o pipefail
+    
+    # Configure talosctl endpoints
+    CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
+    echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
+    talosctl config endpoint $CONTROL_STATIC_IPS
+    
+    export TALOSCONFIG="$CLUSTER_DIR/talosconfig"
+    echo "Using talosconfig: $TALOSCONFIG"
+fi
+
 # At this point, first control node is ready! Bootstrap immediately.
 
 # ==============================================================================
@@ -1159,40 +1275,53 @@ echo "✓ Control plane is ready. Workers will join after bootstrap."
 # This creates the etcd cluster and starts Kubernetes components
 # ==============================================================================
 
-echo -e "\n==> Step 8: Bootstrapping Kubernetes cluster..."
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    echo -e "\n==> Step 8: Bootstrapping Kubernetes cluster..."
 
-# Temporarily disable pipefail to avoid SIGPIPE from head
-set +o pipefail
-FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
-set -o pipefail
+    # Temporarily disable pipefail to avoid SIGPIPE from head
+    set +o pipefail
+    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+    set -o pipefail
 
-echo "Bootstrapping on first ready node: ${FIRST_CP_STATIC_IP}"
+    echo "Bootstrapping on first ready node: ${FIRST_CP_STATIC_IP}"
 
-RETRY=0
-MAX_RETRY=3
-while [ $RETRY -lt $MAX_RETRY ]; do
-    if talosctl -n "$FIRST_CP_STATIC_IP" bootstrap; then
-        echo "✓ Bootstrap successful."
-        break
-    fi
-    RETRY=$((RETRY+1))
-    if [ $RETRY -lt $MAX_RETRY ]; then
-        echo "! Bootstrap failed, retrying in 15s... (Attempt $RETRY/$MAX_RETRY)"
-        sleep 15
-    fi
-done
+    RETRY=0
+    MAX_RETRY=3
+    while [ $RETRY -lt $MAX_RETRY ]; do
+        if talosctl -n "$FIRST_CP_STATIC_IP" bootstrap; then
+            echo "✓ Bootstrap successful."
+            break
+        fi
+        RETRY=$((RETRY+1))
+        if [ $RETRY -lt $MAX_RETRY ]; then
+            echo "! Bootstrap failed, retrying in 15s... (Attempt $RETRY/$MAX_RETRY)"
+            sleep 15
+        fi
+    done
 
-if [ $RETRY -eq $MAX_RETRY ]; then
-    echo "✗ Bootstrap failed after $MAX_RETRY attempts. Cluster may already be bootstrapped or there's a critical issue."
-    echo "  Try manually: talosctl -n $FIRST_CP_STATIC_IP bootstrap"
-else
-    # Verify etcd is healthy after bootstrap
-    echo "Verifying etcd cluster health..."
-    sleep 10  # Give etcd a moment to stabilize
-    if talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null | grep -q "Running"; then
-        echo "✓ Etcd is running and healthy"
+    if [ $RETRY -eq $MAX_RETRY ]; then
+        echo "✗ Bootstrap failed after $MAX_RETRY attempts. Cluster may already be bootstrapped or there's a critical issue."
+        echo "  Try manually: talosctl -n $FIRST_CP_STATIC_IP bootstrap"
     else
-        echo "⚠ Warning: Could not verify etcd status (may still be starting)"
+        # Verify etcd is healthy after bootstrap
+        echo "Verifying etcd cluster health..."
+        sleep 10  # Give etcd a moment to stabilize
+        if talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null | grep -q "Running"; then
+            echo "✓ Etcd is running and healthy"
+        else
+            echo "⚠ Warning: Could not verify etcd status (may still be starting)"
+        fi
+    fi
+else
+    echo -e "\n==> Step 8: Skipping bootstrap as requested."
+    echo "Cluster should already be bootstrapped."
+    
+    # First control plane IP should already be set from the else block above
+    # But set it again if somehow needed
+    if [ -z "$FIRST_CP_STATIC_IP" ]; then
+        set +o pipefail
+        FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+        set -o pipefail
     fi
 fi
 
@@ -1202,106 +1331,110 @@ fi
 # Now that bootstrap is complete, wait for other control nodes to join etcd
 # ==============================================================================
 
-CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
-    echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
-    
-    READY_NODES="$FIRST_CP_STATIC_IP"
-    MAX_WAIT=90
-    ELAPSED=0
-    
-    echo "Waiting for ${CONTROL_NODE_COUNT} control nodes to join etcd cluster..."
-    while [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-        for ip in $CONTROL_STATIC_IPS; do
-            # Skip if already marked as ready
-            if echo "$READY_NODES" | grep -q "$ip"; then
-                continue
-            fi
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
+    if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
+        echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
+        
+        READY_NODES="$FIRST_CP_STATIC_IP"
+        MAX_WAIT=90
+        ELAPSED=0
+        
+        echo "Waiting for ${CONTROL_NODE_COUNT} control nodes to join etcd cluster..."
+        while [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ] && [ $ELAPSED -lt $MAX_WAIT ]; do
+            for ip in $CONTROL_STATIC_IPS; do
+                # Skip if already marked as ready
+                if echo "$READY_NODES" | grep -q "$ip"; then
+                    continue
+                fi
+                
+                # Check if node is responsive
+                if talosctl -n "$ip" version --client=false &>/dev/null; then
+                    READY_NODES="$READY_NODES $ip"
+                    READY_COUNT=$(echo "$READY_NODES" | wc -w)
+                    echo "✓ Control node joined: $ip [${READY_COUNT}/${CONTROL_NODE_COUNT}]"
+                fi
+            done
             
-            # Check if node is responsive
-            if talosctl -n "$ip" version --client=false &>/dev/null; then
-                READY_NODES="$READY_NODES $ip"
-                READY_COUNT=$(echo "$READY_NODES" | wc -w)
-                echo "✓ Control node joined: $ip [${READY_COUNT}/${CONTROL_NODE_COUNT}]"
+            if [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ]; then
+                if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+                    echo -n " [${ELAPSED}s]"
+                else
+                    echo -n "."
+                fi
+                sleep 2
+                ELAPSED=$((ELAPSED + 2))
             fi
         done
         
-        if [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ]; then
-            if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-                echo -n " [${ELAPSED}s]"
-            else
-                echo -n "."
-            fi
-            sleep 2
-            ELAPSED=$((ELAPSED + 2))
+        FINAL_COUNT=$(echo "$READY_NODES" | wc -w)
+        if [ $FINAL_COUNT -lt $CONTROL_NODE_COUNT ]; then
+            echo ""
+            echo "⚠ Warning: Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined after ${MAX_WAIT}s"
+            echo "Check missing nodes with: talosctl -n <ip> get members --namespace=os"
+        else
+            echo ""
+            echo "✓ All ${CONTROL_NODE_COUNT} control nodes have joined the cluster!"
         fi
-    done
-    
-    FINAL_COUNT=$(echo "$READY_NODES" | wc -w)
-    if [ $FINAL_COUNT -lt $CONTROL_NODE_COUNT ]; then
-        echo ""
-        echo "⚠ Warning: Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined after ${MAX_WAIT}s"
-        echo "Check missing nodes with: talosctl -n <ip> get members --namespace=os"
-    else
-        echo ""
-        echo "✓ All ${CONTROL_NODE_COUNT} control nodes have joined the cluster!"
     fi
-fi
 
-# ==============================================================================
-# Step 8b: Verify Worker Nodes
-# ==============================================================================
-# Wait for workers to come up and verify they're ready
-# Workers were installed in parallel during Step 7 and will join automatically
-# ==============================================================================
+    # ==============================================================================
+    # Step 8b: Verify Worker Nodes
+    # ==============================================================================
+    # Wait for workers to come up and verify they're ready
+    # Workers were installed in parallel during Step 7 and will join automatically
+    # ==============================================================================
 
-if [ -n "$WORKER_IPS" ]; then
-    echo -e "\n==> Step 8b: Verifying worker nodes..."
-    
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Phase 3b: Waiting for worker nodes to be ready"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    
-    # Get worker static IPs
-    WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-    
-    FIRST_WORKER_READY=""
-    MAX_WAIT=90
-    ELAPSED=0
-    
-    echo "Checking for first ready worker node..."
-    while [ -z "$FIRST_WORKER_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-        for ip in $WORKER_STATIC_IPS; do
-            # Use authenticated connection
-            if talosctl -n "$ip" version --client=false &>/dev/null; then
-                FIRST_WORKER_READY="$ip"
-                echo ""
-                echo "✓ First worker node ready: $ip (${ELAPSED}s)"
-                break
+    if [ -n "$WORKER_IPS" ]; then
+        echo -e "\n==> Step 8b: Verifying worker nodes..."
+        
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Phase 3b: Waiting for worker nodes to be ready"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Get worker static IPs
+        WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
+        
+        FIRST_WORKER_READY=""
+        MAX_WAIT=90
+        ELAPSED=0
+        
+        echo "Checking for first ready worker node..."
+        while [ -z "$FIRST_WORKER_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
+            for ip in $WORKER_STATIC_IPS; do
+                # Use authenticated connection
+                if talosctl -n "$ip" version --client=false &>/dev/null; then
+                    FIRST_WORKER_READY="$ip"
+                    echo ""
+                    echo "✓ First worker node ready: $ip (${ELAPSED}s)"
+                    break
+                fi
+            done
+            
+            if [ -z "$FIRST_WORKER_READY" ]; then
+                if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+                    echo -n " [${ELAPSED}s]"
+                else
+                    echo -n "."
+                fi
+                sleep 2
+                ELAPSED=$((ELAPSED + 2))
             fi
         done
         
         if [ -z "$FIRST_WORKER_READY" ]; then
-            if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-                echo -n " [${ELAPSED}s]"
-            else
-                echo -n "."
-            fi
-            sleep 2
-            ELAPSED=$((ELAPSED + 2))
+            echo ""
+            echo "⚠ Warning: No worker nodes ready after ${MAX_WAIT}s"
+            echo "Workers may still be booting or joining. Check manually with: kubectl get nodes"
+        else
+            echo "✓ Worker nodes are ready and will join the cluster"
         fi
-    done
-    
-    if [ -z "$FIRST_WORKER_READY" ]; then
-        echo ""
-        echo "⚠ Warning: No worker nodes ready after ${MAX_WAIT}s"
-        echo "Workers may still be booting or joining. Check manually with: kubectl get nodes"
     else
-        echo "✓ Worker nodes are ready and will join the cluster"
+        echo -e "\n⚠ No worker nodes found to verify"
     fi
 else
-    echo -e "\n⚠ No worker nodes found to verify"
+    echo -e "\n==> Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
 fi
 
 # ==============================================================================
@@ -1311,27 +1444,32 @@ fi
 # Retrieve and save kubeconfig for kubectl access
 # ==============================================================================
 
-echo -e "\n==> Step 9: Retrieving kubeconfig and printing summary..."
-cd $pwd
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    echo -e "\n==> Step 9: Retrieving kubeconfig..."
+    cd $pwd
 
-echo "Waiting for Kubernetes API to be ready..."
-RETRY=0
-MAX_RETRY=20
-while [ $RETRY -lt $MAX_RETRY ]; do
-    if talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force 2>/dev/null; then
-        echo "✓ Kubeconfig retrieved successfully."
-        break
-    fi
-    RETRY=$((RETRY+1))
-    if [ $RETRY -lt $MAX_RETRY ]; then
-        echo -n "."
-        sleep 10
-    fi
-done
+    echo "Waiting for Kubernetes API to be ready..."
 
-if [ $RETRY -eq $MAX_RETRY ]; then
-    echo "\n✗ Failed to retrieve kubeconfig after $((MAX_RETRY * 10))s."
-    echo "  The cluster may still be initializing. Try later: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
+    RETRY=0
+    MAX_RETRY=20
+    while [ $RETRY -lt $MAX_RETRY ]; do
+        if talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force 2>/dev/null; then
+            echo "✓ Kubeconfig retrieved successfully."
+            break
+        fi
+        RETRY=$((RETRY+1))
+        if [ $RETRY -lt $MAX_RETRY ]; then
+            echo -n "."
+            sleep 10
+        fi
+    done
+
+    if [ $RETRY -eq $MAX_RETRY ]; then
+        echo "\n✗ Failed to retrieve kubeconfig after $((MAX_RETRY * 10))s."
+        echo "  The cluster may still be initializing. Try later: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
+    fi
+else
+    echo -e "\n==> Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
 fi
 
 # ==============================================================================
@@ -1341,89 +1479,192 @@ fi
 # This avoids certificate issues and provides optimal performance
 # ==============================================================================
 
-echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
+if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
+    echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
 
-# Check if cilium CLI is available
-if ! command -v cilium &> /dev/null; then
-    echo "Installing Cilium CLI..."
-    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
-    CLI_ARCH=amd64
-    if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
-    curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
-    sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
-    $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
-    rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
-    echo "✓ Cilium CLI installed"
+    # Wait for Kubernetes API to be fully ready
+    echo "Waiting for Kubernetes API to be fully ready..."
+    RETRY=0
+    MAX_RETRY=60  # 10 minutes max
+    API_READY=false
+    
+    while [ $RETRY -lt $MAX_RETRY ]; do
+        # Try to list nodes - this confirms API server is responding
+        if kubectl get nodes &>/dev/null; then
+            API_READY=true
+            echo ""
+            echo "✓ Kubernetes API is ready (${RETRY}0s)"
+            break
+        fi
+        
+        if [ $RETRY -eq 0 ]; then
+            echo -n "Waiting for API server to be ready"
+        fi
+        
+        # Show progress every 3 attempts (30 seconds)
+        if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
+            echo -n " [${RETRY}0s]"
+        else
+            echo -n "."
+        fi
+        
+        sleep 10
+        RETRY=$((RETRY+1))
+    done
+    
+    if [ "$API_READY" = false ]; then
+        echo ""
+        echo "⚠ Warning: Kubernetes API still not ready after $((MAX_RETRY * 10))s"
+        echo "  Cannot install Cilium. Check cluster status:"
+        echo "  - talosctl -n $FIRST_CP_STATIC_IP service kubelet status"
+        echo "  - talosctl -n $FIRST_CP_STATIC_IP service etcd status"
+        exit 1
+    fi
+
+    # Check if cilium CLI is available
+    if ! command -v cilium &> /dev/null; then
+        echo "Installing Cilium CLI..."
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        CLI_ARCH=amd64
+        if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+        $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        echo "✓ Cilium CLI installed"
+    fi
+
+    # kubeprism! port 7445
+    # Install Cilium with KubePrism configuration
+    echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
+    cilium install \
+        --set kubeProxyReplacement=true \
+        --set k8sServiceHost=127.0.0.1 \
+        --set k8sServicePort=7445 \ 
+        --set envoy.enabled=true \
+        --set envoyConfig.enabled=true \
+        --set envoyConfig.secretsNamespace.name=cilium \
+        --set gatewayAPI.enabled=true \
+        --set gatewayAPI.secretsNamespace.name=cilium \
+        --set sysctlfix.enabled=false \
+        --set ingressController.enabled=false \
+        --set ingressController.loadbalancerMode=dedicated \
+        --set externalIPs.enabled=true \
+        --set l2announcements.enabled=true \
+        --set l2podAnnouncements.enabled=true \
+        --set l2podAnnouncements.interface=eth1 \
+        --set loadBalancer.l7.backend=envoy \
+        --set debug.enabled=true \
+        --set debug.verbose=flow \
+        --set hubble.relay.enabled=true \
+        --set hubble.ui.enabled=true
+
+
+    # Wait for Cilium to be ready
+    echo "Waiting for Cilium to be ready..."
+    RETRY=0
+    MAX_RETRY=30
+    while [ $RETRY -lt $MAX_RETRY ]; do
+        if cilium status --wait=false 2>/dev/null | grep -q "Cilium:.*OK"; then
+            echo "✓ Cilium is ready"
+            break
+        fi
+        RETRY=$((RETRY+1))
+        if [ $RETRY -lt $MAX_RETRY ]; then
+            echo -n "."
+            sleep 10
+        fi
+    done
+
+    if [ $RETRY -eq $MAX_RETRY ]; then
+        echo "\n⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
+        echo "  Check status with: cilium status"
+    else
+        # Show Cilium status
+        echo ""
+        cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
+    fi
+else
+    echo -e "\n==> Step 10: Skipping Cilium installation as requested."
 fi
 
-# kubeprism! port 7445
-# Install Cilium with KubePrism configuration
-echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
-cilium install \
-    --set kubeProxyReplacement=true \
-    --set k8sServiceHost=127.0.0.1 \
-    --set k8sServicePort=7445 \ 
-    --set envoy.enabled=true \
-    --set envoyConfig.enabled=true \
-    --set envoyConfig.secretsNamespace.name=cilium \
-    --set gatewayAPI.enabled=true \
-    --set gatewayAPI.secretsNamespace.name=cilium \
-    --set sysctlfix.enabled=false \
-    --set ingressController.enabled=false \
-    --set ingressController.loadbalancerMode=dedicated \
-    --set externalIPs.enabled=true \
-    --set l2announcements.enabled=true \
-    --set l2podAnnouncements.enabled=true \
-    --set l2podAnnouncements.interface=eth1 \
-    --set loadBalancer.l7.backend=envoy \
-    --set debug.enabled=true \
-    --set debug.verbose=flow \
-    --set hubble.relay.enabled=true \
-    --set hubble.ui.enabled=true
+# ==============================================================================
+# Step 11: Install ArgoCD
+# ==============================================================================
+# Install ArgoCD for GitOps-based application deployment
+# Uses HA manifests and installs Gateway API CRDs
+# ==============================================================================
 
-
-# Wait for Cilium to be ready
-echo "Waiting for Cilium to be ready..."
-RETRY=0
-MAX_RETRY=30
-while [ $RETRY -lt $MAX_RETRY ]; do
-    if cilium status --wait=false 2>/dev/null | grep -q "Cilium:.*OK"; then
-        echo "✓ Cilium is ready"
-        break
-    fi
-    RETRY=$((RETRY+1))
-    if [ $RETRY -lt $MAX_RETRY ]; then
-        echo -n "."
-        sleep 10
-    fi
-done
-
-if [ $RETRY -eq $MAX_RETRY ]; then
-    echo "\n⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
-    echo "  Check status with: cilium status"
-else
-    # Show Cilium status
+if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
+    echo -e "\n==> Step 11: Installing ArgoCD..."
+    
+    # Wait for cluster to be ready
+    echo "Waiting for cluster to be ready..."
+    kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || echo "⚠ Nodes may still be initializing"
+    
+    # Install ArgoCD namespace
+    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Install ArgoCD HA components
+    echo "Installing ArgoCD (HA mode)..."
+    kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/master/manifests/ha/namespace-install.yaml
+    kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/master/manifests/ha/install.yaml
+    
+    # Install Gateway API CRDs
+    echo "Installing Gateway API CRDs..."
+    kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install.yaml
+    
+    # Wait for ArgoCD server to be ready
+    echo "Waiting for ArgoCD server to be ready..."
+    kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s || echo "⚠ ArgoCD may still be starting"
+    
+    # Get initial admin password
+    ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+    
     echo ""
-    cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
+    echo "✓ ArgoCD installed successfully!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📋 ArgoCD Access Information:"
+    echo "   • Username: admin"
+    if [ -n "$ARGOCD_PASSWORD" ]; then
+        echo "   • Password: $ARGOCD_PASSWORD"
+    else
+        echo "   • Password: Run 'kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d'"
+    fi
+    echo "   • Port-forward: kubectl port-forward svc/argocd-server -n argocd 8080:443"
+    echo "   • Access at: https://localhost:8080"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    # Optional: Apply deployment.yml if it exists
+    if [ -f "${pwd}/argocd/deployment.yml" ]; then
+        echo "Found argocd/deployment.yml - would you like to apply it? (requires GitHub credentials)"
+        echo "This will set up the ArgoCD Application for GitOps."
+        echo "Note: You'll need to create the GitHub secret manually first."
+        echo ""
+        echo "To apply later, run:"
+        echo "  kubectl apply -f argocd/deployment.yml"
+    fi
+else./bootstrap-cluster.sh --skip-iso-download
+    echo -e "\n==> Step 11: Skipping ArgoCD installation as requested."
 fi
 
 # ==============================================================================
 # Cleanup temporary files
 # ==============================================================================
 
-echo -e "\n==> Cleaning up temporary files..."
-cd "$CLUSTER_DIR"
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    echo -e "\n==> Cleaning up temporary files..."
+    cd "$CLUSTER_DIR"
 
-# Remove temporary directories
-if [ -d "./node-configs" ]; then
-    rm -rf ./node-configs
-    echo "  ✓ Removed node-configs/"
+    # Remove temporary directories
+    if [ -d "./node-configs" ]; then
+        rm -rf ./node-configs
+        echo "  ✓ Removed node-configs/"
+    fi
+
+    echo "  ✓ Kept: talosconfig, secrets.yaml, controlplane.yaml, worker.yaml and *-patched.yaml files"
 fi
-
-# Remove base config templates and secrets
-rm -f ./controlplane.yaml ./worker.yaml ./secrets.yaml 2>/dev/null && echo "  ✓ Removed base config templates and secrets"
-
-echo "  ✓ Kept: talosconfig and *-patched.yaml files"
 
 # ==============================================================================
 # Final Summary
@@ -1432,16 +1673,32 @@ echo "  ✓ Kept: talosconfig and *-patched.yaml files"
 echo -e "\n✅ Cluster setup complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📋 Cluster Summary:"
-echo "   • Control nodes: ${CONTROL_NODE_COUNT}"
-echo "   • Worker nodes: ${WORKER_NODE_COUNT}"
-echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
-echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
-echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    echo "   • Control nodes: ${CONTROL_NODE_COUNT}"
+    echo "   • Worker nodes: ${WORKER_NODE_COUNT}"
+    echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
+fi
+if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
+    echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
+fi
+if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
+    echo "   • GitOps: ArgoCD (HA mode)"
+fi
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
+fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "To verify your cluster, run:"
-echo "  kubectl get nodes"
-echo "  cilium status"
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+    echo "  kubectl get nodes"
+fi
+if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
+    echo "  cilium status"
+fi
+if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
+    echo "  kubectl get pods -n argocd"
+fi
 echo ""
 
 # ==============================================================================
