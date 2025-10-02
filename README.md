@@ -58,4 +58,18 @@ Was trying to use a shell script but thought this will be very demanding to crea
   kernel = each.value.role == "control-node" ? "${path.module}/vmlinuz" : null
   cmdline = each.value.role == "control-node" ? [{key = "ip", value = "${each.value.ip}::${each.value.gateway}:255.255.255.0::eth0.100:::::"}] : null
 
-## 
+## terraform prevent destroy works when remove the block from the tf files...
+this is sooo weird
+cannot set a variable but can remove the block and then apply....wtf.
+
+## deployment on argocd
+
+3. On argocd: 
+    1. install k8s
+    2. install cilium
+    3. install external-dns
+    4. install cert-manager
+    5. install argocd
+    6. install external-secrets
+    7. install gateway-api
+    8. install argocd-apps

@@ -6,8 +6,11 @@ terraform.tfstate
 *.tfstate.backup
 
 *.vagrant*
-metal-amd64.iso
-sha256sum.txt
+*metal-amd64.iso*
+*sha256sum.txt*
 
 *.envrc*
 *.env*
+
+*cluster*
+*talosconfig*
