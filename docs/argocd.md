@@ -1,4 +1,29 @@
-# Deploy ArgoCD with olm
+# argocd stuff
+
+## install argocd
+
+install argocd crds
+
+`k -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/master/manifests/ha/namespace-install.yaml`
+`k -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/master/manifests/ha/install.yaml`
+
+install gateway rpcs
+
+`k apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install`
+
+## Add github repository to argocd
+
+```bash
+k apply -f argocd/deployment.yml
+
+k create secret generic github-creds -n argocd --from-literal=username=dmuiX --from-literal=token=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
+
+kubectl label secret github-creds -n argocd argocd.argoproj.io/secret-type=repository                          ─╯
+
+kubectl patch secret github-creds -n argocd --type='merge' -p='{"stringData":{"type":"git","url":"https://github.com/dmuiX/argocd.k8sdev.cloud.git"}}'
+```
+
+## Deploy ArgoCD with olm
 
 Firt install olm:
 
