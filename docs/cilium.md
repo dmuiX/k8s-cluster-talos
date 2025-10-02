@@ -1,11 +1,13 @@
 # some setttings
 
-deploy cilium
+## deploy cilium
+
+kubeprism port is on 7445
 
 cilium install \
     --set kubeProxyReplacement=true \
     --set k8sServiceHost=127.0.0.1 \
-    --set k8sServicePort=7445 \ # kubeprism! 
+    --set k8sServicePort=7445 \
     --set envoy.enabled=true \
     --set envoyConfig.enabled=true \
     --set envoyConfig.secretsNamespace.name=cilium \
