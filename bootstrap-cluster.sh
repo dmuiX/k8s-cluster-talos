@@ -28,13 +28,19 @@
 # Usage:
 #   ./bootstrap-cluster.sh [options]
 #
-# Options:
-#   --skip-iso-download  Skip downloading Talos ISO and Ubuntu image
-#   --skip-terraform     Skip VM creation (use existing VMs)
-#   --debug              Enable verbose bash debug mode (set -x)
-#   --no-cleanup         Disable automatic terraform destroy on error
-#   --cleanup-vms        Destroy only VMs (keeps Cloudflare DNS records)
-#   --cleanup-all        Complete cleanup: VMs + DNS (terraform destroy)
+# OPTIONS:
+#     -h, --help              Show this help message and exit
+#     --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
+#     --no-custom-iso         Use standard ISO instead of custom (with extensions)
+#     --skip-terraform        Skip VM creation (use existing VMs)
+#     --skip-config-creation  Skip generating Talos configs (use existing configs)
+#     --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
+#     --skip-cilium-installation  Skip Cilium CNI installation
+#     --skip-argocd-installation  Skip ArgoCD installation
+#     --debug                 Enable verbose bash debug mode (set -x)
+#     --no-cleanup            Disable automatic terraform destroy on error
+#     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
+#     --cleanup-all           Complete cleanup: VMs + DNS (terraform destroy)
 #
 # ==============================================================================
 
@@ -55,6 +61,7 @@ OPTIONS:
     --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
     --no-custom-iso         Use standard ISO instead of custom (with extensions)
     --skip-terraform        Skip VM creation (use existing VMs)
+    --skip-config-creation  Skip generating Talos configs (use existing configs)
     --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
     --skip-cilium-installation  Skip Cilium CNI installation
     --skip-argocd-installation  Skip ArgoCD installation
@@ -223,6 +230,7 @@ fi
 
 SKIP_TERRAFORM=false
 SKIP_ISO_DOWNLOAD=false
+SKIP_CONFIG_CREATION=false
 SKIP_BOOTSTRAP=false
 SKIP_CILIUM_INSTALLATION=false
 SKIP_ARGOCD_INSTALLATION=false
@@ -244,6 +252,10 @@ for arg in "$@"; do
             ;;
         --skip-terraform)
             SKIP_TERRAFORM=true
+            shift
+            ;;
+        --skip-config-creation)
+            SKIP_CONFIG_CREATION=true
             shift
             ;;
         --skip-bootstrap)
@@ -647,7 +659,7 @@ generate_patch_files_by_role() {
               .cluster.apiServer.admissionControl[0].configuration.defaults."warn-version" = "latest" |
               .cluster.apiServer.admissionControl[0].configuration.exemptions.usernames = [] |
               .cluster.apiServer.admissionControl[0].configuration.exemptions.runtimeClasses = [] |
-              .cluster.apiServer.admissionControl[0].configuration.exemptions.namespaces = ["kube-system", "cilium"] |
+              .cluster.apiServer.admissionControl[0].configuration.exemptions.namespaces = ["cilium"] |
               .cluster.network.cni.name = "none" |
               .cluster.proxy.disabled = true |
               .cluster.allowSchedulingOnControlPlanes = true
@@ -692,8 +704,6 @@ generate_patch_files_by_role() {
 # Main Script Execution
 # ==============================================================================
 
-if [ "$SKIP_BOOTSTRAP" = false ]; then
-
 echo "==> Step 2a: Performing pre-flight checks..."
 
 # Install required command-line tools if not already present
@@ -714,28 +724,6 @@ fi
 
 cd "$CLUSTER_DIR"
 
-echo "==> Step 2b: Detecting install disk from VM configuration..."
-
-# Get the actual disk device from a control node VM
-# This ensures we use the correct disk path that libvirt configured
-# Temporarily disable pipefail to avoid SIGPIPE errors from head
-set +o pipefail
-FIRST_CONTROL_NODE=$(yq e '.nodes[] | select(.role == "control-node") | .name' "$NODES_FILE_PATH" | head -1)
-DISK_TARGET=$($SUDO virsh domblklist "$FIRST_CONTROL_NODE" 2>/dev/null | grep -v "^$" | tail -n +3 | grep -v ".iso" | awk '{print $1}' | head -1)
-set -o pipefail
-
-if [ -z "$DISK_TARGET" ]; then
-    echo "Warning: Could not detect disk from VM, using default /dev/vda"
-    INSTALL_DISK="/dev/vda"
-else
-    # virsh shows the target (e.g., 'vda'), we need full path
-    INSTALL_DISK="/dev/${DISK_TARGET}"
-    echo "Detected install disk from VM: ${INSTALL_DISK}"
-fi
-
-echo "Note: Talos will auto-detect the first disk as /dev/sda or /dev/vda during installation"
-
-
 # ==============================================================================
 # Step 3: Generate Talos Secrets and Machine Configurations
 # ==============================================================================
@@ -743,49 +731,79 @@ echo "Note: Talos will auto-detect the first disk as /dev/sda or /dev/vda during
 #   - Secrets bundle (certificates, tokens, keys)
 #   - Base machine configs for control plane and workers
 #   - Configure Kubernetes API endpoint (HAProxy IP)
+# Only run if NOT skipping config creation
 # ==============================================================================
 
-echo -e "\n==> Step 3a: Generating secrets bundle..."
-if [ ! -f "secrets.yaml" ]; then
-    talosctl gen secrets --output-file secrets.yaml
-else
-    echo "Secrets bundle 'secrets.yaml' already exists."
-fi
+if [ "$SKIP_CONFIG_CREATION" = false ]; then
+    echo "==> Step 2b: Detecting install disk from VM configuration..."
 
+    # Get the actual disk device from a control node VM
+    # This ensures we use the correct disk path that libvirt configured
+    # Temporarily disable pipefail to avoid SIGPIPE errors from head
+    set +o pipefail
+    FIRST_CONTROL_NODE=$(yq e '.nodes[] | select(.role == "control-node") | .name' "$NODES_FILE_PATH" | head -1)
+    DISK_TARGET=$($SUDO virsh domblklist "$FIRST_CONTROL_NODE" 2>/dev/null | grep -v "^$" | tail -n +3 | grep -v ".iso" | awk '{print $1}' | head -1)
+    set -o pipefail
 
-echo -e "\n==> Step 3b: Reading HAProxy IP for Kubernetes endpoint..."
-HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
-if [ -z "$HAPROXY_IP" ]; then
-    echo "Error: Could not find HAProxy IP in $NODES_FILE_PATH" >&2
-    exit 1
-fi
-K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
-echo "Kubernetes endpoint will be: ${K8S_ENDPOINT}"
-
-
-echo -e "\n==> Step 3c: Generating machine configurations..."
-
-# Check if configs already exist
-if [ -f "controlplane.yaml" ] || [ -f "worker.yaml" ]; then
-    echo "⚠ Warning: Machine configurations already exist!"
-    echo "  This will regenerate configs and may break access to existing cluster."
-    read -p "Do you want to overwrite them? (yes/no): " -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-        echo "Skipping config generation. Using existing configs."
+    if [ -z "$DISK_TARGET" ]; then
+        echo "Warning: Could not detect disk from VM, using default /dev/vda"
+        INSTALL_DISK="/dev/vda"
     else
-        echo "Regenerating configs..."
-        rm -f controlplane.yaml worker.yaml 2>/dev/null
+        # virsh shows the target (e.g., 'vda'), we need full path
+        INSTALL_DISK="/dev/${DISK_TARGET}"
+        echo "Detected install disk from VM: ${INSTALL_DISK}"
+    fi
+
+    echo "Note: Talos will auto-detect the first disk as /dev/sda or /dev/vda during installation"
+    echo ""
+    
+    # Continue with config generation below...
+    echo -e "\n==> Step 3a: Generating secrets bundle..."
+    if [ ! -f "secrets.yaml" ]; then
+        talosctl gen secrets --output-file secrets.yaml
+    else
+        echo "Secrets bundle 'secrets.yaml' already exists."
+    fi
+
+    echo -e "\n==> Step 3b: Reading HAProxy IP for Kubernetes endpoint..."
+    HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
+    if [ -z "$HAPROXY_IP" ]; then
+        echo "Error: Could not find HAProxy IP in $NODES_FILE_PATH" >&2
+        exit 1
+    fi
+    K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
+    echo "Kubernetes endpoint will be: ${K8S_ENDPOINT}"
+
+    echo -e "\n==> Step 3c: Generating machine configurations..."
+
+    if [ -f "controlplane.yaml" ] || [ -f "worker.yaml" ]; then
+        echo "⚠ Warning: Machine configurations already exist!"
+        echo "  This will regenerate configs and may break access to existing cluster."
+        read -p "Do you want to overwrite them? (yes/no): " -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+            echo "Skipping config generation. Using existing configs."
+        else
+            echo "Regenerating configs..."
+            rm -f controlplane.yaml worker.yaml 2>/dev/null
+            talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
+            echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
+        fi
+    else
+        # First time generation
         talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
         echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
     fi
 else
-    # First time generation
-    talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
-    echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
-fi
-
-# Close the skip-bootstrap conditional temporarily - reopen for Steps 6-7
+    echo -e "\n==> Step 3: Skipping config generation (--skip-config-creation flag set)"
+    echo "Using existing configs. Make sure you have:"
+    echo "  - secrets.yaml"
+    echo "  - controlplane.yaml and worker.yaml"
+    
+    # Still need to read HAProxy IP for later steps
+    HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
+    K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
+    INSTALL_DISK="/dev/vda"  # Default, won't be used for generation
 fi
 
 # ==============================================================================
@@ -796,32 +814,7 @@ fi
 #   - Nodes are booting from the Talos ISO (live environment)
 #   - Network interfaces will get DHCP IPs from the router
 #   - Static IPs are NOT configured yet (they're in the machine config)
-# ==============================================================================
-
-# Always run Step 5 to generate patches (useful for reference even with skip-bootstrap)
-echo -e "\n==> Step 4-5: Generating node-specific configurations..."
-cd "$CLUSTER_DIR"
-mkdir -p ./node-configs
-CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
-echo "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
-
-# Use the new helper function to create patch files.
-generate_patch_files_by_role "control-node"
-generate_patch_files_by_role "worker-node"
-
-# Re-open skip-bootstrap conditional for Steps 6-7
-if [ "$SKIP_BOOTSTRAP" = false ]; then
-
-echo -e "\n==> Continuing with node installation..."
-
-
-# ==============================================================================
-# Step 6: Discover Dynamic IPs and Apply Configurations
-
-# ==============================================================================
-# Step 5: Create Node-Specific Patched Configs
-# ==============================================================================
+#
 # Generate machine configs for each node with:
 #   - Static IP addresses
 #   - Hostname
@@ -830,16 +823,31 @@ echo -e "\n==> Continuing with node installation..."
 # These configs will be applied to nodes running on DHCP IPs
 # ==============================================================================
 
-echo -e "\n==> Step 5: Creating node-specific configurations..."
+echo -e "\n==> Step 4-5: Generating node-specific configurations..."
+cd "$CLUSTER_DIR"
 mkdir -p ./node-configs
-CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
-echo "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
 
-# Use the new helper function to create patch files.
-generate_patch_files_by_role "control-node"
-generate_patch_files_by_role "worker-node"
+if [ "$SKIP_CONFIG_CREATION" = true ]; then
+    echo "Skipping node-specific config generation (--skip-config-creation flag set)."
+else
+    CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
+    WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
+    echo "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
 
+    # Use the new helper function to create patch files.
+    generate_patch_files_by_role "control-node"
+    generate_patch_files_by_role "worker-node"
+fi
+
+# ==============================================================================
+# Steps 6-9: Bootstrap Process
+# ==============================================================================
+# Only run if NOT skipping bootstrap
+# ==============================================================================
+
+if [ "$SKIP_BOOTSTRAP" = false ]; then
+
+echo -e "\n==> Continuing with node installation and bootstrap..."
 
 # ==============================================================================
 # Step 6: Discover Dynamic IPs and Apply Configurations
@@ -1534,30 +1542,63 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
         echo "✓ Cilium CLI installed"
     fi
 
+    # Clean up any existing Cilium installation
+    echo "Checking for existing Cilium resources..."
+    if kubectl get ns cilium &>/dev/null 2>&1; then
+        echo "Found existing Cilium, removing..."
+        
+        # Remove Helm release if it exists
+        helm uninstall cilium -n cilium --no-hooks 2>/dev/null || true
+        
+        # Force cleanup with cilium CLI (30s timeout)
+        timeout 30 cilium uninstall 2>/dev/null || echo "Cilium CLI cleanup completed"
+        
+        # Force delete namespaces
+        kubectl delete ns cilium cilium-test --grace-period=0 --force 2>/dev/null || true
+        
+        echo "Cleanup complete, waiting 5s..."
+        sleep 5
+    else
+        echo "No existing Cilium installation found."
+    fi
+    
+    # Create cilium namespace with Helm labels and annotations (idempotent)
+    kubectl create namespace cilium --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label namespace cilium app.kubernetes.io/managed-by=Helm --overwrite
+    kubectl annotate namespace cilium meta.helm.sh/release-name=cilium meta.helm.sh/release-namespace=cilium --overwrite
+
     # kubeprism! port 7445
     # Install Cilium with KubePrism configuration
     echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
     cilium install \
+        --namespace cilium \
+        --set ipam.mode=kubernetes \
+        --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
+        --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}" \
+        --set cgroup.autoMount.enabled=false \
+        --set cgroup.hostRoot=/sys/fs/cgroup \
         --set kubeProxyReplacement=true \
-        --set k8sServiceHost=127.0.0.1 \
-        --set k8sServicePort=7445 \ 
+        --set k8sServiceHost=localhost \
+        --set k8sServicePort=7445 \
         --set envoy.enabled=true \
         --set envoyConfig.enabled=true \
         --set envoyConfig.secretsNamespace.name=cilium \
         --set gatewayAPI.enabled=true \
         --set gatewayAPI.secretsNamespace.name=cilium \
+        --set gatewayAPI.enableAlpn=true \
+        --set gatewayAPI.enableAppProtocol=true\
         --set sysctlfix.enabled=false \
-        --set ingressController.enabled=false \
-        --set ingressController.loadbalancerMode=dedicated \
         --set externalIPs.enabled=true \
         --set l2announcements.enabled=true \
         --set l2podAnnouncements.enabled=true \
-        --set l2podAnnouncements.interface=eth1 \
+        --set l2podAnnouncements.interface=ens3 \
         --set loadBalancer.l7.backend=envoy \
         --set debug.enabled=true \
         --set debug.verbose=flow \
+        --set hubble.enabled=true \
         --set hubble.relay.enabled=true \
-        --set hubble.ui.enabled=true
+        --set hubble.ui.enabled=true \
+        --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,httpV2:exemplars=true;labelsContext=source_ip\,source_namespace\,source_workload\,destination_ip\,destination_namespace\,destination_workload\,traffic_direction}"
 
 
     # Wait for Cilium to be ready
@@ -1565,19 +1606,30 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
     RETRY=0
     MAX_RETRY=30
     while [ $RETRY -lt $MAX_RETRY ]; do
-        if cilium status --wait=false 2>/dev/null | grep -q "Cilium:.*OK"; then
-            echo "✓ Cilium is ready"
+        # Just check if cilium pods are running
+        if kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q "Running"; then
+            echo ""
+            echo "✓ Cilium is ready (${RETRY}0s)"
             break
         fi
-        RETRY=$((RETRY+1))
-        if [ $RETRY -lt $MAX_RETRY ]; then
-            echo -n "."
-            sleep 10
+        
+        if [ $RETRY -eq 0 ]; then
+            echo -n "Checking Cilium pods"
         fi
+        
+        if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
+            echo -n " [${RETRY}0s]"
+        else
+            echo -n "."
+        fi
+        
+        sleep 10
+        RETRY=$((RETRY+1))
     done
 
     if [ $RETRY -eq $MAX_RETRY ]; then
-        echo "\n⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
+        echo ""
+        echo "⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
         echo "  Check status with: cilium status"
     else
         # Show Cilium status
@@ -1645,7 +1697,7 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
         echo "To apply later, run:"
         echo "  kubectl apply -f argocd/deployment.yml"
     fi
-else./bootstrap-cluster.sh --skip-iso-download
+else
     echo -e "\n==> Step 11: Skipping ArgoCD installation as requested."
 fi
 
