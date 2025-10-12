@@ -11,6 +11,12 @@ install gateway rpcs
 
 `k apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install`
 
+## Add repo
+
+ k create secret generic github-creds -n argocd --from-literal=name=github-repo --from-literal=type="git" --from-literal=url="https://github.com/dmuiX/argocd.k8sdev.cloud.git"  --from-literal=username="dmuiX" --from-literal=password="github_pat_1" --dry-run=client -o yaml | kubectl label --local -f - "argocd.argoproj.io/secret-type=repository" -o yaml | kubectl apply -f -
+
+
+ k create secret generic github-creds -n argocd --from-literal=type="git" --from-literal=url="https://github.com/dmuiX/argocd.k8sdev.cloud.git"  --from-literal=username="dmuiX" --from-literal=password="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" --dry-run=client -o yaml | kubectl label --local -f - "argocd.argoproj.io/secret-type=repository" -o yaml | kubectl apply -f -
 ## Add github repository to argocd
 
 ```bash

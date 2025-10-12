@@ -15,28 +15,9 @@ spec:
     targetRevision: HEAD
     directory:
       recurse: true
-      jsonnet: {}
   syncPolicy:
     syncOptions:
       - CreateNamespace=true
     automated:
       prune: true
       selfHeal: true
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: argocd-cm
-  namespace: argocd
-  labels:
-    app.kubernetes.io/name: argocd-cm
-    app.kubernetes.io/part-of: argocd
-data:
-  repositories: |
-    - url: https://github.com/dmuiX/argocd.k8sdev.cloud.git
-      usernameSecret:
-        name: github-creds
-        key: username
-      passwordSecret:
-        name: github-creds
-        key: token
