@@ -31,12 +31,12 @@
 # OPTIONS:
 #     -h, --help              Show this help message and exit
 #     --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
-#     --no-custom-iso         Use standard ISO instead of custom (with extensions)
 #     --skip-terraform        Skip VM creation (use existing VMs)
 #     --skip-config-creation  Skip generating Talos configs (use existing configs)
 #     --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
 #     --skip-cilium-installation  Skip Cilium CNI installation
 #     --skip-argocd-installation  Skip ArgoCD installation
+#     --skip-fluxcd-installation  Skip FluxCD installation
 #     --debug                 Enable verbose bash debug mode (set -x)
 #     --no-cleanup            Disable automatic terraform destroy on error
 #     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
@@ -59,12 +59,12 @@ Automates the complete setup of a Talos Linux Kubernetes cluster on KVM/libvirt.
 OPTIONS:
     -h, --help              Show this help message and exit
     --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
-    --no-custom-iso         Use standard ISO instead of custom (with extensions)
     --skip-terraform        Skip VM creation (use existing VMs)
     --skip-config-creation  Skip generating Talos configs (use existing configs)
     --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
     --skip-cilium-installation  Skip Cilium CNI installation
     --skip-argocd-installation  Skip ArgoCD installation
+    --skip-fluxcd-installation  Skip FluxCD installation
     --debug                 Enable verbose bash debug mode (set -x)
     --no-cleanup            Disable automatic terraform destroy on error
     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
@@ -233,8 +233,8 @@ SKIP_ISO_DOWNLOAD=false
 SKIP_CONFIG_CREATION=false
 SKIP_BOOTSTRAP=false
 SKIP_CILIUM_INSTALLATION=false
-SKIP_ARGOCD_INSTALLATION=false
-USE_CUSTOM_ISO=true
+SKIP_ARGOCD_INSTALLATION=true
+SKIP_FLUXCD_INSTALLATION=false
 DEBUG=false
 
 for arg in "$@"; do
@@ -244,10 +244,6 @@ for arg in "$@"; do
             ;;
         --skip-iso-download)
             SKIP_ISO_DOWNLOAD=true
-            shift
-            ;;
-        --no-custom-iso)
-            USE_CUSTOM_ISO=false
             shift
             ;;
         --skip-terraform)
@@ -324,42 +320,6 @@ fi
 #
 # Uses Talos Image Factory API to generate custom ISO with schematic ID
 # ==============================================================================
-
-ensure_custom_iso() {
-    TALOS_VERSION="${TALOS_VERSION:-1.11.2}"
-    if [ -f "$METALISO_ABSOLUTE_PATH" ]; then
-        echo "==> ISO exists."
-        return
-    fi
-    
-    echo "==> Generating custom ISO..."
-
-    # necessary to write it like that because EOF isnt working any other way!
-    # Create schematic YAML defining required extensions
-    local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
-        -H "Content-Type: application/vnd.yaml" \
-        --data-binary @- <<EOF | jq -r '.id'
-customization:
-    systemExtensions:
-        officialExtensions:
-        - siderolabs/qemu-guest-agent
-        - siderolabs/amd-ucode
-        - siderolabs/util-linux-tools
-        - siderolabs/iscsi-tools
-EOF
-)
-    
-    if [ -z "$schematic_id" ] || [ "$schematic_id" = "null" ]; then
-        echo "Error: Failed to get schematic ID"
-        exit 1
-    fi
-    
-    echo "Schematic ID: $schematic_id"
-    
-    # Download custom ISO using schematic ID and Talos version
-    curl -Lo "$METALISO_ABSOLUTE_PATH" "https://factory.talos.dev/image/${schematic_id}/${TALOS_VERSION}/metal-amd64.iso"
-    echo "✓ Custom ISO downloaded."
-}
 
 # ==============================================================================
 # Generic download function with retry and checksum verification
@@ -470,21 +430,15 @@ download_and_verify() {
 if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
     cd "${VMS_DIR}"
     
-    # Download or generate Talos Metal ISO
-    if [ "$USE_CUSTOM_ISO" = true ]; then
-        echo "==> Generating custom Talos ISO with extensions..."
-        ensure_custom_iso
-    else
-        echo "==> Downloading standard Talos ISO..."
-        download_and_verify \
-            "Talos metal ISO" \
-            "$TALOS_ISO_URL" \
-            "$METALISO_ABSOLUTE_PATH" \
-            "$TALOS_CHECKSUM_URL" \
-            "" \
-            "false" \
-            "true"
-    fi
+    echo "==> Downloading standard Talos ISO..."
+    download_and_verify \
+        "Talos metal ISO" \
+        "$TALOS_ISO_URL" \
+        "$METALISO_ABSOLUTE_PATH" \
+        "$TALOS_CHECKSUM_URL" \
+        "" \
+        "false" \
+        "true"
     
     # Download Ubuntu Cloud Image for HAProxy
     download_and_verify \
@@ -560,6 +514,13 @@ fi
 # ==============================================================================
 
 # talosctl configuration
+
+# Create cluster directory if it doesn't exist
+if [ ! -d "$CLUSTER_DIR" ]; then
+    echo "Cluster directory '$CLUSTER_DIR' does not exist. Creating it."
+    mkdir -p "$CLUSTER_DIR"
+fi
+
 cd "${CLUSTER_DIR}"
 
 # Check if talosctl is installed, if not, install it
@@ -611,7 +572,23 @@ generate_patch_files_by_role() {
         local patch_file="./node-configs/${name}-network-patch.yaml"
         echo "  ✓ ${name} network patch → ${patch_file}"
         
+        # necessary to write it like that because EOF isnt working any other way!
+        # Create schematic YAML defining required extensions
+        local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
+            -H "Content-Type: application/yaml" \
+            --data-binary @- <<'EOF' | jq -r '.id'
+customization:
+    systemExtensions:
+        officialExtensions:
+        - siderolabs/qemu-guest-agent
+        - siderolabs/amd-ucode
+        - siderolabs/util-linux-tools
+        - siderolabs/iscsi-tools
+EOF
+)
+
         # Export variables for yq to use in YAML generation
+        export SCHEMATIC_ID="$schematic_id"
         export IP="$ip"
         export GATEWAY="$gateway"
         export MAC="$mac"
@@ -629,10 +606,11 @@ generate_patch_files_by_role() {
         else
             export NODE_ROLE_LABEL="worker"
         fi
-        
+
         # Generate network patch based on role
         if [ "$role" == "control-node" ]; then
             yq e -n '
+              .machine.install.image = "factory.talos.dev/installer/" + strenv(SCHEMATIC_ID) + ":v1.11.2" |
               .machine.network.hostname = env(name) |
               .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
               .machine.network.interfaces[0].dhcp = false |
@@ -641,14 +619,14 @@ generate_patch_files_by_role() {
               .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
               .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
               .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
-              .machine.kubelet.clusterDNS = ["10.96.0.10"] |
+              .machine.kubelet.clusterDNS = [ "10.96.0.10" ] |
               .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
               .machine.kubelet.extraArgs.rotate-server-certificates = true |
+              .machine.sysctls.vm.nr_hugepages = "1024" |
               .machine.sysctls."net.ipv4.ip_forward" = "1" |
               .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
               .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
-              .machine.kernel.modules[0].name = "br_netfilter" |
-              .machine.kernel.modules[1].name = "overlay" |
+              .machine.kernel.modules = [ {"name": "br_netfilter"}, {"name": "overlay"}, {"name": "nvme_tcp"}, {"name": "vfio_pci"} ]
               .cluster.apiServer.admissionControl[0].name = "PodSecurity" |
               .cluster.apiServer.admissionControl[0].configuration.apiVersion = "pod-security.admission.config.k8s.io/v1" |
               .cluster.apiServer.admissionControl[0].configuration.kind = "PodSecurityConfiguration" |
@@ -665,10 +643,11 @@ generate_patch_files_by_role() {
               .cluster.proxy.disabled = true |
               .cluster.allowSchedulingOnControlPlanes = true |
               .cluster.extraManifests= [ "https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/standalone-install.yaml", "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml" ] |
-              .machine.files = [{ "content": "[metrics]\n  address = \"0.0.0.0:11234\"", "path": "/var/cri/conf.d/metrics.toml", "op": "create"}
+              .machine.files = [{ "content": "[metrics]\naddress = \"0.0.0.0:11234\"\ngrpc_histogram = false", "path": "/var/cri/conf.d/metrics.toml", "op": "create"}]
             ' > "$patch_file"
         else
             yq e -n '
+              .machine.install.image = "factory.talos.dev/installer/" + strenv(SCHEMATIC_ID) + ":v1.11.2" |
               .machine.network.hostname = env(name) |
               .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
               .machine.network.interfaces[0].dhcp = false |
@@ -679,15 +658,16 @@ generate_patch_files_by_role() {
               .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
               .machine.kubelet.clusterDNS = ["10.96.0.10"] |
               .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
+              .machine.sysctls.vm.nr_hugepages = "1024" |
               .machine.sysctls."net.ipv4.ip_forward" = "1" |
               .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
               .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
-              .machine.kernel.modules[0].name = "br_netfilter" |
-              .machine.kernel.modules[1].name = "overlay" |
+              .machine.kernel.modules = [ {"name": "br_netfilter"}, {"name": "overlay"}, {"name": "nvme_tcp"}, {"name": "vfio_pci"} ]
               .machine.nodeLabels."node-role.kubernetes.io/worker" = "worker" |
               .cluster.network.cni.name = "none" |
               .cluster.proxy.disabled = true |
-              .cluster.allowSchedulingOnControlPlanes = true
+              .cluster.allowSchedulingOnControlPlanes = false | 
+              .machine.files = [{ "content": "[metrics]\naddress = \"0.0.0.0:11234\"\ngrpc_histogram = false", "path": "/var/cri/conf.d/metrics.toml", "op": "create"}]
             ' > "$patch_file"
         fi
         
@@ -718,12 +698,6 @@ if ! command -v yq &> /dev/null; then echo "yq not found, installing..."; $SUDO 
 if ! command -v jq &> /dev/null; then echo "jq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y jq; fi
 if ! command -v curl &> /dev/null; then echo "curl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y curl; fi
 if ! command -v $SUDO arp-scan $> /dev/null; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
-
-# Create cluster directory if it doesn't exist
-if [ ! -d "$CLUSTER_DIR" ]; then
-    echo "Cluster directory '$CLUSTER_DIR' does not exist. Creating it."
-    mkdir -p "$CLUSTER_DIR"
-fi
 
 cd "$CLUSTER_DIR"
 
@@ -931,151 +905,6 @@ apply_config_with_retry() {
   return 1
 }
 
-# Process nodes (control or worker) with full installation workflow
-process_nodes() {
-  local role=$1
-  local node_ips=$2
-  local role_display=$3
-  
-  echo -e "\nApplying config to ${role_display}s (parallel installation):"
-  
-  if [ -z "$node_ips" ]; then
-    echo "ERROR: No ${role_display}s found in discovered IPs!" >&2
-    exit 1
-  fi
-  
-  local total_nodes=$(echo "$node_ips" | wc -l)
-  echo "Processing ${total_nodes} ${role_display}(s)..."
-  
-  # Phase 1: Apply configs to ALL nodes in parallel
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "Phase 1: Applying configurations to all nodes"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  
-  local node_number=1
-  local failed_nodes=""
-  
-  echo "$node_ips" | while read -r name dyn_ip; do
-    echo "[${node_number}/${total_nodes}] Applying config to ${name} (${dyn_ip})..."
-    (
-      if ! apply_config_with_retry "$name" "$dyn_ip" "./${name}-patched.yaml"; then
-        echo "$name" >> /tmp/failed_nodes_$$
-      fi
-    ) &
-    node_number=$((node_number + 1))
-  done
-  
-  # Wait for all background jobs to complete
-  wait
-  
-  # Check for failures
-  if [ -f /tmp/failed_nodes_$$ ]; then
-    failed_nodes=$(cat /tmp/failed_nodes_$$)
-    rm -f /tmp/failed_nodes_$$
-    echo "⚠ Warning: Some nodes failed to apply config: $failed_nodes"
-    echo "Continuing with remaining nodes..."
-  else
-    echo "✓ All configs applied successfully"
-  fi
-  
-
-  # Phase 2: Change boot order to disk-first
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "Phase 2: Setting boot order (disk first, cdrom second)"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-  cd "$VMS_DIR"
-  echo "$node_ips" | while read -r name dyn_ip; do
-    if [ -z "$name" ]; then
-      continue
-    fi
-    
-    echo "Processing VM: $name"
-    
-    # Change boot order directly with virt-xml
-    $SUDO virt-xml "$name" --edit --boot hd,cdrom
-    
-    echo "  ✓ Boot order updated for $name"
-  done
-  cd "$CLUSTER_DIR"
-
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "Restarting VMs to apply boot order changes"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-  echo "$node_ips" | while read -r name dyn_ip; do
-    if [ -z "$name" ]; then
-      continue
-    fi
-    
-    echo "Restarting $name..."
-    $SUDO virsh destroy "$name" 2>/dev/null || true
-    sleep 2
-    $SUDO virsh start "$name"
-    echo "  ✓ $name restarted"
-  done
-
-  echo "✓ All VMs now boot from disk first"
-
-  
-  # Phase 3: Smart wait for nodes to come back with static IPs
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "Phase 3: Waiting for nodes to reboot with static IPs"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  
-  # Get static IPs based on role
-  if [ "$role" = "control-node" ]; then
-    local static_ips=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-  else
-    local static_ips=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-  fi
-  
-  local first_ready=""
-  local max_wait=90
-  local elapsed=0
-  
-  # For control nodes, configure talosctl endpoints
-  if [ "$role" = "control-node" ]; then
-    echo "Configuring talosctl endpoints: $static_ips"
-    talosctl config endpoint $static_ips
-  fi
-  
-  # Check for first ready node (both control and worker)
-  echo "Checking for first ready ${role_display}..."
-  while [ -z "$first_ready" ] && [ $elapsed -lt $max_wait ]; do
-    for ip in $static_ips; do
-      # Use authenticated connection with merged config
-      if talosctl -n "$ip" version --client=false &>/dev/null; then
-        first_ready="$ip"
-        echo ""
-        echo "✓ First ${role_display} ready: $ip (${elapsed}s)"
-        break
-      fi
-    done
-    
-    if [ -z "$first_ready" ]; then
-      if [ $((elapsed % 10)) -eq 0 ] && [ $elapsed -gt 0 ]; then
-        echo -n " [${elapsed}s]"
-      else
-        echo -n "."
-      fi
-      sleep 2
-      elapsed=$((elapsed + 2))
-    fi
-  done
-  
-  if [ -z "$first_ready" ]; then
-    echo ""
-    echo "⚠ Warning: No ${role_display}s ready after ${max_wait}s, continuing anyway"
-  fi
-  
-  echo "✓ ${role_display}s should now be running with static IPs"
-}
-
 cd "$VMS_DIR"
 
 # Discovery parameters
@@ -1090,59 +919,59 @@ echo "Discovering node IPs with arp-scan..."
 echo "Looking for ${EXPECTED_NODE_COUNT} Talos nodes with DHCP-assigned IPs..."
 
 while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    # Run the discovery command
-    DISCOVERED_IPS=$(join -1 1 -2 1 -o 1.2,2.2 \
-        <(terraform output -json | jq -r '.node_macs.value | to_entries[] | "\(.value | ascii_downcase) \(.key)"' | sort -k1,1) \
-        <(sudo arp-scan --interface=br0 --localnet | awk '/:/ {print $2, $1}' | sort -k1,1))
+  # Run the discovery command
+  DISCOVERED_IPS=$(join -1 1 -2 1 -o 1.2,2.2 \
+      <(terraform output -json | jq -r '.node_macs.value | to_entries[] | "\(.value | ascii_downcase) \(.key)"' | sort -k1,1) \
+      <(sudo arp-scan --interface=br0 --localnet | awk '/:/ {print $2, $1}' | sort -k1,1))
 
-    if [ -n "$DISCOVERED_IPS" ]; then
-        # Verify at least one node is actually ready (Talos API responding)
-        NODE_READY=false
-        echo "$DISCOVERED_IPS" | while read -r name ip; do
-            if timeout 2 talosctl -n "$ip" version --insecure &>/dev/null; then
-                NODE_READY=true
-                break
-            fi
-        done 2>/dev/null
-        
-        # If we have IPs and at least one responds, we're good
-        FOUND_COUNT=$(echo "$DISCOVERED_IPS" | wc -l)
-        if [ "$FOUND_COUNT" -ge "$EXPECTED_NODE_COUNT" ]; then
-            DYNAMIC_IPS="$DISCOVERED_IPS"
-            break
-        fi
-    fi
+  if [ -n "$DISCOVERED_IPS" ]; then
+      # Verify at least one node is actually ready (Talos API responding)
+      NODE_READY=false
+      echo "$DISCOVERED_IPS" | while read -r name ip; do
+          if timeout 2 talosctl -n "$ip" version --insecure &>/dev/null; then
+              NODE_READY=true
+              break
+          fi
+      done 2>/dev/null
+      
+      # If we have IPs and at least one responds, we're good
+      FOUND_COUNT=$(echo "$DISCOVERED_IPS" | wc -l)
+      if [ "$FOUND_COUNT" -ge "$EXPECTED_NODE_COUNT" ]; then
+          DYNAMIC_IPS="$DISCOVERED_IPS"
+          break
+      fi
+  fi
 
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    if [ $((RETRY_COUNT % 4)) -eq 0 ]; then
-        echo "  [${RETRY_COUNT}×${RETRY_DELAY}s] Still waiting for nodes to boot..."
-    else
-        echo -n "."
-    fi
-    sleep $RETRY_DELAY
+  RETRY_COUNT=$((RETRY_COUNT + 1))
+  if [ $((RETRY_COUNT % 4)) -eq 0 ]; then
+      echo "  [${RETRY_COUNT}×${RETRY_DELAY}s] Still waiting for nodes to boot..."
+  else
+      echo -n "."
+  fi
+  sleep $RETRY_DELAY
 done
 
 if [ $((RETRY_COUNT % 4)) -ne 0 ] && [ $RETRY_COUNT -gt 0 ]; then
-    echo ""
+  echo ""
 fi
 
 # Fail if no nodes are found after all retries
 if [ -z "$DYNAMIC_IPS" ]; then
-    echo "Error: Failed to discover any node IPs with arp-scan after $((MAX_RETRIES * RETRY_DELAY))s." >&2
-    echo "--- Diagnostics ---"
-    echo "VM Status:"
-    virsh list --all
-    echo "-------------------"
-    echo "arp-scan raw output:"
-    sudo arp-scan --interface=br0 --localnet
-    echo "-------------------"
-    exit 1
+  echo "Error: Failed to discover any node IPs with arp-scan after $((MAX_RETRIES * RETRY_DELAY))s." >&2
+  echo "--- Diagnostics ---"
+  echo "VM Status:"
+  virsh list --all
+  echo "-------------------"
+  echo "arp-scan raw output:"
+  sudo arp-scan --interface=br0 --localnet
+  echo "-------------------"
+  exit 1
 fi
 
 FOUND_COUNT=$(echo "$DYNAMIC_IPS" | wc -l)
 echo "✓ Successfully discovered ${FOUND_COUNT}/${EXPECTED_NODE_COUNT} nodes"
 echo "$DYNAMIC_IPS" | while read -r name ip; do
-    echo "  • $name → $ip"
+  echo "  • $name → $ip"
 done
 
 # Change back to cluster directory where the patched configs are located
@@ -1179,10 +1008,10 @@ fi
 TOTAL_NODES=$(echo "$ALL_NODE_IPS" | wc -l)
 echo "Processing ${TOTAL_NODES} node(s) total..."
 
-# Phase 1: Apply configs to ALL nodes in parallel
+# Phase 7.1: Apply configs to ALL nodes in parallel
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 1: Applying configurations to all nodes"
+echo "Phase 7.1: Applying configurations to all nodes"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 NODE_NUMBER=1
@@ -1211,29 +1040,44 @@ else
   echo "✓ All configs applied successfully"
 fi
 
-# Phase 2: Eject ISOs from all nodes
+# Phase 7.2: Change boot order to disk-first (ISO remains attached as fallback)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 2: Ejecting ISOs (nodes are rebooting)"
+echo "Phase 7.2: Setting boot order (disk first, cdrom fallback)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 cd "$VMS_DIR"
+
+# Process ALL nodes (both control and worker)
 echo "$ALL_NODE_IPS" | while read -r name dyn_ip; do
-  ISO_LINE=$($SUDO virsh domblklist "$name" | grep "\.iso" || true)
-  if [ -n "$ISO_LINE" ]; then
-    TARGET=$(echo "$ISO_LINE" | awk '{print $1}')
-    echo "Ejecting ISO from ${name}..."
-    $SUDO virsh change-media "$name" "$TARGET" --eject 2>/dev/null || true
+  if [ -z "$name" ]; then
+    continue
+  fi
+  
+  echo "Setting boot order for: $name"
+  
+  # Use virt-xml to set boot order: disk first, cdrom second
+  # This persists the change in the VM definition
+  if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
+    echo "  ✓ Boot order updated for $name (disk->cdrom)"
+  else
+    echo "  ⚠ Warning: Failed to update boot order for $name"
   fi
 done
+
 cd "$CLUSTER_DIR"
 
-echo "✓ ISOs ejected"
-
-# Phase 3: Wait ONLY for first control node to be ready
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 3: Waiting for first control node to be ready"
+echo "Note: ISOs remain attached as fallback boot option"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+echo "✓ All VMs now boot from disk first"
+
+# Phase 7.3: Wait ONLY for first control node to be ready
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Phase 7.3: Waiting for first control node to be ready"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Get control plane static IPs
@@ -1366,144 +1210,139 @@ fi
 # ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-    CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-    if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
-        echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
-        
-        READY_NODES="$FIRST_CP_STATIC_IP"
-        MAX_WAIT=90
-        ELAPSED=0
-        
-        echo "Waiting for ${CONTROL_NODE_COUNT} control nodes to join etcd cluster..."
-        while [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-            for ip in $CONTROL_STATIC_IPS; do
-                # Skip if already marked as ready
-                if echo "$READY_NODES" | grep -q "$ip"; then
-                    continue
-                fi
-                
-                # Check if node is responsive
-                if talosctl -n "$ip" version --client=false &>/dev/null; then
-                    READY_NODES="$READY_NODES $ip"
-                    READY_COUNT=$(echo "$READY_NODES" | wc -w)
-                    echo "✓ Control node joined: $ip [${READY_COUNT}/${CONTROL_NODE_COUNT}]"
-                fi
-            done
-            
-            if [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ]; then
-                if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-                    echo -n " [${ELAPSED}s]"
-                else
-                    echo -n "."
-                fi
-                sleep 2
-                ELAPSED=$((ELAPSED + 2))
-            fi
-        done
-        
-        FINAL_COUNT=$(echo "$READY_NODES" | wc -w)
-        if [ $FINAL_COUNT -lt $CONTROL_NODE_COUNT ]; then
-            echo ""
-            echo "⚠ Warning: Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined after ${MAX_WAIT}s"
-            echo "Check missing nodes with: talosctl -n <ip> get members --namespace=os"
-        else
-            echo ""
-            echo "✓ All ${CONTROL_NODE_COUNT} control nodes have joined the cluster!"
-        fi
-    fi
+  CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
+  if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
+      echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
+      
+      READY_NODES="$FIRST_CP_STATIC_IP"
+      MAX_WAIT=90
+      ELAPSED=0
+      
+      echo "Waiting for ${CONTROL_NODE_COUNT} control nodes to join etcd cluster..."
+      while [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ] && [ $ELAPSED -lt $MAX_WAIT ]; do
+          for ip in $CONTROL_STATIC_IPS; do
+              # Skip if already marked as ready
+              if echo "$READY_NODES" | grep -q "$ip"; then
+                  continue
+              fi
+              
+              # Check if node is responsive
+              if talosctl -n "$ip" version --client=false &>/dev/null; then
+                  READY_NODES="$READY_NODES $ip"
+                  READY_COUNT=$(echo "$READY_NODES" | wc -w)
+                  echo "✓ Control node joined: $ip [${READY_COUNT}/${CONTROL_NODE_COUNT}]"
+              fi
+          done
+          
+          if [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ]; then
+              if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+                  echo -n " [${ELAPSED}s]"
+              else
+                  echo -n "."
+              fi
+              sleep 2
+              ELAPSED=$((ELAPSED + 2))
+          fi
+      done
+      
+      FINAL_COUNT=$(echo "$READY_NODES" | wc -w)
+      if [ $FINAL_COUNT -lt $CONTROL_NODE_COUNT ]; then
+          echo ""
+          echo "⚠ Warning: Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined after ${MAX_WAIT}s"
+          echo "Check missing nodes with: talosctl -n <ip> get members --namespace=os"
+      else
+          echo ""
+          echo "✓ All ${CONTROL_NODE_COUNT} control nodes have joined the cluster!"
+      fi
+  fi
 
-    # ==============================================================================
-    # Step 8b: Verify Worker Nodes
-    # ==============================================================================
-    # Wait for workers to come up and verify they're ready
-    # Workers were installed in parallel during Step 7 and will join automatically
-    # ==============================================================================
+  # ==============================================================================
+  # Step 8b: Verify Worker Nodes
+  # ==============================================================================
+  # Wait for workers to come up and verify they're ready
+  # Workers were installed in parallel during Step 7 and will join automatically
+  # ==============================================================================
 
-    if [ -n "$WORKER_IPS" ]; then
-        echo -e "\n==> Step 8b: Verifying worker nodes..."
-        
-        echo ""
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "Phase 3b: Waiting for worker nodes to be ready"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        
-        # Get worker static IPs
-        WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-        
-        FIRST_WORKER_READY=""
-        MAX_WAIT=90
-        ELAPSED=0
-        
-        echo "Checking for first ready worker node..."
-        while [ -z "$FIRST_WORKER_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-            for ip in $WORKER_STATIC_IPS; do
-                # Use authenticated connection
-                if talosctl -n "$ip" version --client=false &>/dev/null; then
-                    FIRST_WORKER_READY="$ip"
-                    echo ""
-                    echo "✓ First worker node ready: $ip (${ELAPSED}s)"
-                    break
-                fi
-            done
-            
-            if [ -z "$FIRST_WORKER_READY" ]; then
-                if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-                    echo -n " [${ELAPSED}s]"
-                else
-                    echo -n "."
-                fi
-                sleep 2
-                ELAPSED=$((ELAPSED + 2))
-            fi
-        done
-        
-        if [ -z "$FIRST_WORKER_READY" ]; then
-            echo ""
-            echo "⚠ Warning: No worker nodes ready after ${MAX_WAIT}s"
-            echo "Workers may still be booting or joining. Check manually with: kubectl get nodes"
-        else
-            echo "✓ Worker nodes are ready and will join the cluster"
-        fi
-    else
-        echo -e "\n⚠ No worker nodes found to verify"
-    fi
+  if [ -n "$WORKER_IPS" ]; then
+      echo -e "\n==> Step 8b: Waiting for worker nodes to be ready and verifying them..."
+
+      # Get worker static IPs
+      WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
+      
+      FIRST_WORKER_READY=""
+      MAX_WAIT=90
+      ELAPSED=0
+      
+      echo "Checking for first ready worker node..."
+      while [ -z "$FIRST_WORKER_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
+          for ip in $WORKER_STATIC_IPS; do
+              # Use authenticated connection
+              if talosctl -n "$ip" version --client=false &>/dev/null; then
+                  FIRST_WORKER_READY="$ip"
+                  echo ""
+                  echo "✓ First worker node ready: $ip (${ELAPSED}s)"
+                  break
+              fi
+          done
+          
+          if [ -z "$FIRST_WORKER_READY" ]; then
+              if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+                  echo -n " [${ELAPSED}s]"
+              else
+                  echo -n "."
+              fi
+              sleep 2
+              ELAPSED=$((ELAPSED + 2))
+          fi
+      done
+      
+      if [ -z "$FIRST_WORKER_READY" ]; then
+          echo ""
+          echo "⚠ Warning: No worker nodes ready after ${MAX_WAIT}s"
+          echo "Workers may still be booting or joining. Check manually with: kubectl get nodes"
+      else
+          echo "✓ Worker nodes are ready and will join the cluster"
+      fi
+  else
+      echo -e "\n⚠ No worker nodes found to verify"
+  fi
 else
-    echo -e "\n==> Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
+  echo -e "\n==> Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
 fi
 
 # ==============================================================================
-# Step 9: Retrieve Kubeconfig and Finalize
+# Step 9: Retrieve Kubeconfig and Finale!
 # ==============================================================================
 # Wait for Kubernetes API server to be ready
 # Retrieve and save kubeconfig for kubectl access
 # ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-    echo -e "\n==> Step 9: Retrieving kubeconfig..."
-    cd $pwd
+  echo -e "\n==> Step 9: Retrieving kubeconfig..."
+  cd $pwd
 
-    echo "Waiting for Kubernetes API to be ready..."
+  echo "Waiting for Kubernetes API to be ready..."
 
-    RETRY=0
-    MAX_RETRY=20
-    while [ $RETRY -lt $MAX_RETRY ]; do
-        if talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force 2>/dev/null; then
-            echo "✓ Kubeconfig retrieved successfully."
-            break
-        fi
-        RETRY=$((RETRY+1))
-        if [ $RETRY -lt $MAX_RETRY ]; then
-            echo -n "."
-            sleep 10
-        fi
-    done
+  RETRY=0
+  MAX_RETRY=20
+  while [ $RETRY -lt $MAX_RETRY ]; do
+      if talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force 2>/dev/null; then
+          echo "✓ Kubeconfig retrieved successfully."
+          break
+      fi
+      RETRY=$((RETRY+1))
+      if [ $RETRY -lt $MAX_RETRY ]; then
+          echo -n "."
+          sleep 10
+      fi
+  done
 
-    if [ $RETRY -eq $MAX_RETRY ]; then
-        echo "\n✗ Failed to retrieve kubeconfig after $((MAX_RETRY * 10))s."
-        echo "  The cluster may still be initializing. Try later: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
-    fi
+  if [ $RETRY -eq $MAX_RETRY ]; then
+      echo "\n✗ Failed to retrieve kubeconfig after $((MAX_RETRY * 10))s."
+      echo "  The cluster may still be initializing. Try later: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
+  fi
 else
-    echo -e "\n==> Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
+  echo -e "\n==> Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
 fi
 
 # ==============================================================================
@@ -1514,149 +1353,149 @@ fi
 # ==============================================================================
 
 if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
-    echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
+  echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
 
-    # Wait for Kubernetes API to be fully ready
-    echo "Waiting for Kubernetes API to be fully ready..."
-    RETRY=0
-    MAX_RETRY=60  # 10 minutes max
-    API_READY=false
-    
-    while [ $RETRY -lt $MAX_RETRY ]; do
-        # Try to list nodes - this confirms API server is responding
-        if kubectl get nodes &>/dev/null; then
-            API_READY=true
-            echo ""
-            echo "✓ Kubernetes API is ready (${RETRY}0s)"
-            break
-        fi
-        
-        if [ $RETRY -eq 0 ]; then
-            echo -n "Waiting for API server to be ready"
-        fi
-        
-        # Show progress every 3 attempts (30 seconds)
-        if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
-            echo -n " [${RETRY}0s]"
-        else
-            echo -n "."
-        fi
-        
-        sleep 10
-        RETRY=$((RETRY+1))
-    done
-    
-    if [ "$API_READY" = false ]; then
-        echo ""
-        echo "⚠ Warning: Kubernetes API still not ready after $((MAX_RETRY * 10))s"
-        echo "  Cannot install Cilium. Check cluster status:"
-        echo "  - talosctl -n $FIRST_CP_STATIC_IP service kubelet status"
-        echo "  - talosctl -n $FIRST_CP_STATIC_IP service etcd status"
-        exit 1
-    fi
+  # Wait for Kubernetes API to be fully ready
+  echo "Waiting for Kubernetes API to be fully ready..."
+  RETRY=0
+  MAX_RETRY=60  # 10 minutes max
+  API_READY=false
+  
+  while [ $RETRY -lt $MAX_RETRY ]; do
+      # Try to list nodes - this confirms API server is responding
+      if kubectl get nodes &>/dev/null; then
+          API_READY=true
+          echo ""
+          echo "✓ Kubernetes API is ready (${RETRY}0s)"
+          break
+      fi
+      
+      if [ $RETRY -eq 0 ]; then
+          echo -n "Waiting for API server to be ready"
+      fi
+      
+      # Show progress every 3 attempts (30 seconds)
+      if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
+          echo -n " [${RETRY}0s]"
+      else
+          echo -n "."
+      fi
+      
+      sleep 10
+      RETRY=$((RETRY+1))
+  done
+  
+  if [ "$API_READY" = false ]; then
+      echo ""
+      echo "⚠ Warning: Kubernetes API still not ready after $((MAX_RETRY * 10))s"
+      echo "  Cannot install Cilium. Check cluster status:"
+      echo "  - talosctl -n $FIRST_CP_STATIC_IP service kubelet status"
+      echo "  - talosctl -n $FIRST_CP_STATIC_IP service etcd status"
+      exit 1
+  fi
 
-    # Check if cilium CLI is available
-    if ! command -v cilium &> /dev/null; then
-        echo "Installing Cilium CLI..."
-        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
-        CLI_ARCH=amd64
-        if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
-        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
-        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
-        $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
-        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
-        echo "✓ Cilium CLI installed"
-    fi
+  # Check if cilium CLI is available
+  if ! command -v cilium &> /dev/null; then
+      echo "Installing Cilium CLI..."
+      CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+      CLI_ARCH=amd64
+      if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+      curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+      sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+      $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+      rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+      echo "✓ Cilium CLI installed"
+  fi
 
-    # Clean up any existing Cilium installation
-    echo "Checking for existing Cilium resources..."
-    if kubectl get ns cilium &>/dev/null 2>&1; then
-        echo "Found existing Cilium, removing..."
-        
-        # Remove Helm release if it exists
-        helm uninstall cilium -n cilium --no-hooks 2>/dev/null || true
-        
-        # Force cleanup with cilium CLI (30s timeout)
-        timeout 30 cilium uninstall 2>/dev/null || echo "Cilium CLI cleanup completed"
-        
-        # Force delete namespaces
-        kubectl delete ns cilium cilium-test --grace-period=0 --force 2>/dev/null || true
-        
-        echo "Cleanup complete, waiting 5s..."
-        sleep 5
-    else
-        echo "No existing Cilium installation found."
-    fi
-    
-    # Create cilium namespace with Helm labels and annotations (idempotent)
-    kubectl create namespace cilium --dry-run=client -o yaml | kubectl apply -f -
-    kubectl label namespace cilium app.kubernetes.io/managed-by=Helm --overwrite
-    kubectl annotate namespace cilium meta.helm.sh/release-name=cilium meta.helm.sh/release-namespace=cilium --overwrite
+  # Clean up any existing Cilium installation
+  echo "Checking for existing Cilium resources..."
+  if kubectl get ns cilium &>/dev/null 2>&1; then
+      echo "Found existing Cilium, removing..."
+      
+      # Remove Helm release if it exists
+      helm uninstall cilium -n cilium --no-hooks 2>/dev/null || true
+      
+      # Force cleanup with cilium CLI (30s timeout)
+      timeout 30 cilium uninstall 2>/dev/null || echo "Cilium CLI cleanup completed"
+      
+      # Force delete namespaces
+      kubectl delete ns cilium cilium-test --grace-period=0 --force 2>/dev/null || true
+      
+      echo "Cleanup complete, waiting 5s..."
+      sleep 5
+  else
+      echo "No existing Cilium installation found."
+  fi
+  
+  # Create cilium namespace with Helm labels and annotations (idempotent)
+  kubectl create namespace cilium --dry-run=client -o yaml | kubectl apply -f -
+  kubectl label namespace cilium app.kubernetes.io/managed-by=Helm --overwrite
+  kubectl annotate namespace cilium meta.helm.sh/release-name=cilium meta.helm.sh/release-namespace=cilium --overwrite
 
-    # kubeprism! port 7445
-    # Install Cilium with KubePrism configuration
-    echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
-    cilium install \
-        --version 1.18.2 \
-        --namespace cilium \
-        --set ipam.mode=kubernetes \
-        --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
-        --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}" \
-        --set cgroup.autoMount.enabled=false \
-        --set cgroup.hostRoot=/sys/fs/cgroup \
-        --set kubeProxyReplacement=true \
-        --set k8sServiceHost=localhost \
-        --set k8sServicePort=7445 \
-        --set envoy.enabled=true \
-        --set envoyConfig.enabled=true \
-        --set envoyConfig.secretsNamespace.name=cilium \
-        --set gatewayAPI.enabled=true \
-        --set gatewayAPI.secretsNamespace.name=cilium \
-        --set gatewayAPI.enableAlpn=true \
-        --set gatewayAPI.enableAppProtocol=true\
-        --set sysctlfix.enabled=false \
-        --set externalIPs.enabled=true \
-        --set installCRDs=true \
-        --set l2announcements.enabled=true \
-        --set loadBalancer.l7.backend=envoy \
-        --set hubble.enabled=false
-    # Wait for Cilium to be ready
-    echo "Waiting for Cilium to be ready..."
-    RETRY=0
-    MAX_RETRY=30
-    while [ $RETRY -lt $MAX_RETRY ]; do
-        # Just check if cilium pods are running
-        if kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q "Running"; then
-            echo ""
-            echo "✓ Cilium is ready (${RETRY}0s)"
-            break
-        fi
-        
-        if [ $RETRY -eq 0 ]; then
-            echo -n "Checking Cilium pods"
-        fi
-        
-        if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
-            echo -n " [${RETRY}0s]"
-        else
-            echo -n "."
-        fi
-        
-        sleep 10
-        RETRY=$((RETRY+1))
-    done
+  # kubeprism! port 7445
+  # Install Cilium with KubePrism configuration
+  echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
+  cilium install \
+      --version 1.18.2 \
+      --namespace cilium \
+      --set ipam.mode=kubernetes \
+      --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
+      --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}" \
+      --set cgroup.autoMount.enabled=false \
+      --set cgroup.hostRoot=/sys/fs/cgroup \
+      --set kubeProxyReplacement=true \
+      --set k8sServiceHost=localhost \
+      --set k8sServicePort=7445 \
+      --set envoy.enabled=true \
+      --set envoyConfig.enabled=true \
+      --set envoyConfig.secretsNamespace.name=cilium \
+      --set gatewayAPI.enabled=true \
+      --set gatewayAPI.secretsNamespace.name=cilium \
+      --set gatewayAPI.enableAlpn=true \
+      --set gatewayAPI.enableAppProtocol=true\
+      --set sysctlfix.enabled=false \
+      --set externalIPs.enabled=true \
+      --set installCRDs=true \
+      --set l2announcements.enabled=true \
+      --set loadBalancer.l7.backend=envoy \
+      --set hubble.enabled=false
+  # Wait for Cilium to be ready
+  echo "Waiting for Cilium to be ready..."
+  RETRY=0
+  MAX_RETRY=30
+  while [ $RETRY -lt $MAX_RETRY ]; do
+      # Just check if cilium pods are running
+      if kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q "Running"; then
+          echo ""
+          echo "✓ Cilium is ready (${RETRY}0s)"
+          break
+      fi
+      
+      if [ $RETRY -eq 0 ]; then
+          echo -n "Checking Cilium pods"
+      fi
+      
+      if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
+          echo -n " [${RETRY}0s]"
+      else
+          echo -n "."
+      fi
+      
+      sleep 10
+      RETRY=$((RETRY+1))
+  done
 
-    if [ $RETRY -eq $MAX_RETRY ]; then
-        echo ""
-        echo "⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
-        echo "  Check status with: cilium status"
-    else
-        # Show Cilium status
-        echo ""
-        cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
-    fi
+  if [ $RETRY -eq $MAX_RETRY ]; then
+      echo ""
+      echo "⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
+      echo "  Check status with: cilium status"
+  else
+      # Show Cilium status
+      echo ""
+      cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
+  fi
 else
-    echo -e "\n==> Step 10: Skipping Cilium installation as requested."
+  echo -e "\n==> Step 10: Skipping Cilium installation as requested."
 fi
 
 # ==============================================================================
@@ -1667,58 +1506,104 @@ fi
 # ==============================================================================
 
 if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
-    echo -e "\n==> Step 11: Installing ArgoCD..."
-    
-    # Wait for cluster to be ready
-    echo "Waiting for cluster to be ready..."
-    kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || echo "⚠ Nodes may still be initializing"
-    
-    # Install ArgoCD namespace
-    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-    
-    # Install ArgoCD HA components
-    echo "Installing ArgoCD (HA mode)..."
-    kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/namespace-install.yaml
-    kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/install.yaml
+  echo -e "\n==> Step 11: Installing ArgoCD..."
+  
+  # Wait for cluster to be ready
+  echo "Waiting for cluster to be ready..."
+  kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || echo "⚠ Nodes may still be initializing"
+  
+  # Install ArgoCD namespace
+  kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+  
+  # Install ArgoCD HA components
+  echo "Installing ArgoCD (HA mode)..."
+  kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/namespace-install.yaml
+  kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/install.yaml
 
-    
-    # Install Gateway API CRDs
-    echo "Installing Gateway API CRDs..."
-    kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install.yaml
-    
-    # Wait for ArgoCD server to be ready
-    echo "Waiting for ArgoCD server to be ready..."
-    kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s || echo "⚠ ArgoCD may still be starting"
-    
-    # Get initial admin password
-    ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-    
-    echo ""
-    echo "✓ ArgoCD installed successfully!"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "📋 ArgoCD Access Information:"
-    echo "   • Username: admin"
-    if [ -n "$ARGOCD_PASSWORD" ]; then
-        echo "   • Password: $ARGOCD_PASSWORD"
-    else
-        echo "   • Password: Run 'kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d'"
-    fi
-    echo "   • Port-forward: kubectl port-forward svc/argocd-server -n argocd 8080:443"
-    echo "   • Access at: https://localhost:8080"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    
-    # Optional: Apply deployment.yml if it exists
-    if [ -f "${pwd}/argocd/deployment.yml" ]; then
-        echo "Found argocd/deployment.yml - would you like to apply it? (requires GitHub credentials)"
-        echo "This will set up the ArgoCD Application for GitOps."
-        echo "Note: You'll need to create the GitHub secret manually first."
-        echo ""
-        echo "To apply later, run:"
-        echo "  kubectl apply -f argocd/deployment.yml"
-    fi
+  
+  # Install Gateway API CRDs
+  echo "Installing Gateway API CRDs..."
+  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install.yaml
+  
+  # Wait for ArgoCD server to be ready
+  echo "Waiting for ArgoCD server to be ready..."
+  kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s || echo "⚠ ArgoCD may still be starting"
+  
+  # Get initial admin password
+  ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+  
+  echo ""
+  echo "✓ ArgoCD installed successfully!"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📋 ArgoCD Access Information:"
+  echo "   • Username: admin"
+  if [ -n "$ARGOCD_PASSWORD" ]; then
+      echo "   • Password: $ARGOCD_PASSWORD"
+  else
+      echo "   • Password: Run 'kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d'"
+  fi
+  echo "   • Port-forward: kubectl port-forward svc/argocd-server -n argocd 8080:443"
+  echo "   • Access at: https://localhost:8080"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  
+  # Optional: Apply deployment.yml if it exists
+  if [ -f "${pwd}/argocd/deployment.yml" ]; then
+      echo "Found argocd/deployment.yml - would you like to apply it? (requires GitHub credentials)"
+      echo "This will set up the ArgoCD Application for GitOps."
+      echo "Note: You'll need to create the GitHub secret manually first."
+      echo ""
+      echo "To apply later, run:"
+      echo "  kubectl apply -f argocd/deployment.yml"
+  fi
 else
-    echo -e "\n==> Step 11: Skipping ArgoCD installation as requested."
+  echo -e "\n==> Step 11: Skipping ArgoCD installation as requested."
+fi
+
+# ==============================================================================
+# 12: Install FluxCD
+# ==============================================================================
+if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
+
+  echo -e "\n==> Step 12: Installing FluxCD ..."
+  # Wait for cluster to be ready
+  echo "Waiting for cluster to be ready..."
+  kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || echo "⚠ Nodes may still be initializing"
+
+  # Install kubectl if not present
+  echo "Checking if kubectl is installed..."
+  if [ kubectl version ]; then
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    rm kubectl
+  fi
+
+  echo "Create secrets for cert-manager and external-dns..."
+  kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token=$CLOUDFLARE_TOKEN
+  kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD=$PIHOLE_PASSWORD --from-literal=EXTERNAL_DNS_PIHOLE_SERVER=$PIHOLE_SERVER --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6"
+
+  # Install flux CLI if not present
+  echo "Checking if FluxCD CLI is installed..."
+  if [ flux --version ]; then
+    curl -s https://fluxcd.io/install.sh | sudo bash
+    . <(flux completion zsh)
+  fi
+
+  echo "Bootstrapping FluxCD with GitHub repository..."
+  flux bootstrap github \
+    --token-auth \
+    --owner=$GITHUB_REPO_OWNER \
+    --repository=$GITHUB_REPO \
+    --branch=main \
+    --path=clusters \
+    --personal \
+    --private=true
+  
+  echo ""
+  echo "✓ FluxCD repo ${GITHUB_REPO_OWNER}/${GITHUB_REPO} deployed successfully!"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+else
+    echo -e "\n==> Step 12: Skipping FluxCD installation as requested."
 fi
 
 # ==============================================================================
@@ -1726,16 +1611,16 @@ fi
 # ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-    echo -e "\n==> Cleaning up temporary files..."
-    cd "$CLUSTER_DIR"
+  echo -e "\n==> Cleaning up temporary files..."
+  cd "$CLUSTER_DIR"
 
-    # Remove temporary directories
-    if [ -d "./node-configs" ]; then
-        rm -rf ./node-configs
-        echo "  ✓ Removed node-configs/"
-    fi
+  # Remove temporary directories
+  if [ -d "./node-configs" ]; then
+    rm -rf ./node-configs
+    echo "  ✓ Removed node-configs/"
+  fi
 
-    echo "  ✓ Kept: talosconfig, secrets.yaml, controlplane.yaml, worker.yaml and *-patched.yaml files"
+  echo "  ✓ Kept: talosconfig, secrets.yaml, controlplane.yaml, worker.yaml and *-patched.yaml files"
 fi
 
 # ==============================================================================
@@ -1746,18 +1631,21 @@ echo -e "\n✅ Cluster setup complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📋 Cluster Summary:"
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-    echo "   • Control nodes: ${CONTROL_NODE_COUNT}"
-    echo "   • Worker nodes: ${WORKER_NODE_COUNT}"
-    echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
+  echo "   • Control nodes: ${CONTROL_NODE_COUNT}"
+  echo "   • Worker nodes: ${WORKER_NODE_COUNT}"
+  echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
 fi
 if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
-    echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
+  echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
 fi
 if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
-    echo "   • GitOps: ArgoCD (HA mode)"
+  echo "   • GitOps: ArgoCD (HA mode)"
+fi
+if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
+  echo "   • GitOps: FluxCD Setup (GitHub repo: $GITHUB_REPO_OWNER/$GITHUB_REPO)"
 fi
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-    echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
+  echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
