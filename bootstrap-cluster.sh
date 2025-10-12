@@ -641,8 +641,9 @@ generate_patch_files_by_role() {
               .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
               .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
               .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
-              .machine.kubelet.clusterDNS = ["169.254.2.53", "10.96.0.10"] |
+              .machine.kubelet.clusterDNS = ["10.96.0.10"] |
               .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
+              .machine.kubelet.extraArgs.rotate-server-certificates = true |
               .machine.sysctls."net.ipv4.ip_forward" = "1" |
               .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
               .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
@@ -662,7 +663,9 @@ generate_patch_files_by_role() {
               .cluster.apiServer.admissionControl[0].configuration.exemptions.namespaces = ["cilium"] |
               .cluster.network.cni.name = "none" |
               .cluster.proxy.disabled = true |
-              .cluster.allowSchedulingOnControlPlanes = true
+              .cluster.allowSchedulingOnControlPlanes = true |
+              .cluster.extraManifests= [ "https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/standalone-install.yaml", "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml" ] |
+              .machine.files = [{ "content": "[metrics]\n  address = \"0.0.0.0:11234\"", "path": "/var/cri/conf.d/metrics.toml", "op": "create"}
             ' > "$patch_file"
         else
             yq e -n '
@@ -674,7 +677,7 @@ generate_patch_files_by_role() {
               .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
               .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
               .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
-              .machine.kubelet.clusterDNS = ["169.254.2.53", "10.96.0.10"] |
+              .machine.kubelet.clusterDNS = ["10.96.0.10"] |
               .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
               .machine.sysctls."net.ipv4.ip_forward" = "1" |
               .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
@@ -976,24 +979,47 @@ process_nodes() {
     echo "✓ All configs applied successfully"
   fi
   
-  # Phase 2: Eject ISOs from all nodes
+
+  # Phase 2: Change boot order to disk-first
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "Phase 2: Ejecting ISOs (nodes are rebooting)"
+  echo "Phase 2: Setting boot order (disk first, cdrom second)"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  
+
   cd "$VMS_DIR"
   echo "$node_ips" | while read -r name dyn_ip; do
-    ISO_LINE=$($SUDO virsh domblklist "$name" | grep "\.iso" || true)
-    if [ -n "$ISO_LINE" ]; then
-      TARGET=$(echo "$ISO_LINE" | awk '{print $1}')
-      echo "Ejecting ISO from ${name}..."
-      $SUDO virsh change-media "$name" "$TARGET" --eject 2>/dev/null || true
+    if [ -z "$name" ]; then
+      continue
     fi
+    
+    echo "Processing VM: $name"
+    
+    # Change boot order directly with virt-xml
+    $SUDO virt-xml "$name" --edit --boot hd,cdrom
+    
+    echo "  ✓ Boot order updated for $name"
   done
   cd "$CLUSTER_DIR"
-  
-  echo "✓ ISOs ejected"
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Restarting VMs to apply boot order changes"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  echo "$node_ips" | while read -r name dyn_ip; do
+    if [ -z "$name" ]; then
+      continue
+    fi
+    
+    echo "Restarting $name..."
+    $SUDO virsh destroy "$name" 2>/dev/null || true
+    sleep 2
+    $SUDO virsh start "$name"
+    echo "  ✓ $name restarted"
+  done
+
+  echo "✓ All VMs now boot from disk first"
+
   
   # Phase 3: Smart wait for nodes to come back with static IPs
   echo ""
@@ -1571,6 +1597,7 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
     # Install Cilium with KubePrism configuration
     echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
     cilium install \
+        --version 1.18.2 \
         --namespace cilium \
         --set ipam.mode=kubernetes \
         --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
@@ -1589,18 +1616,10 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
         --set gatewayAPI.enableAppProtocol=true\
         --set sysctlfix.enabled=false \
         --set externalIPs.enabled=true \
+        --set installCRDs=true \
         --set l2announcements.enabled=true \
-        --set l2podAnnouncements.enabled=true \
-        --set l2podAnnouncements.interface=ens3 \
         --set loadBalancer.l7.backend=envoy \
-        --set debug.enabled=true \
-        --set debug.verbose=flow \
-        --set hubble.enabled=true \
-        --set hubble.relay.enabled=true \
-        --set hubble.ui.enabled=true \
-        --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,httpV2:exemplars=true;labelsContext=source_ip\,source_namespace\,source_workload\,destination_ip\,destination_namespace\,destination_workload\,traffic_direction}"
-
-
+        --set hubble.enabled=false
     # Wait for Cilium to be ready
     echo "Waiting for Cilium to be ready..."
     RETRY=0
@@ -1659,8 +1678,9 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
     
     # Install ArgoCD HA components
     echo "Installing ArgoCD (HA mode)..."
-    kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/master/manifests/ha/namespace-install.yaml
-    kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/master/manifests/ha/install.yaml
+    kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/namespace-install.yaml
+    kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/install.yaml
+
     
     # Install Gateway API CRDs
     echo "Installing Gateway API CRDs..."
