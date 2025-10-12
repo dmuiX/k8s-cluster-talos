@@ -14,8 +14,6 @@ cilium install \
     --set gatewayAPI.enabled=true \
     --set gatewayAPI.secretsNamespace.name=cilium \
     --set sysctlfix.enabled=false \
-    --set ingressController.enabled=false \
-    --set ingressController.loadbalancerMode=dedicated \
     --set externalIPs.enabled=true \
     --set l2announcements.enabled=true \
     --set l2podAnnouncements.enabled=true \
@@ -23,6 +21,7 @@ cilium install \
     --set loadBalancer.l7.backend=envoy \
     --set debug.enabled=true \
     --set debug.verbose=flow \
+    --set hubble.enabled=true \
     --set hubble.relay.enabled=true \
     --set hubble.ui.enabled=true
 
