@@ -73,3 +73,20 @@ cannot set a variable but can remove the block and then apply....wtf.
     6. install external-secrets
     7. install gateway-api
     8. install argocd-apps
+   
+
+## Upgrade or change to custom iso 
+
+```bash
+cd /home/nasadmin/k8s-cluster-talos && curl -sX POST "https://factory.talos.dev/schematics" -H "Content-Type: application/vnd.yaml" --data-binary @- <<'EOF' | jq -r '.id'
+customization:
+    systemExtensions:
+        officialExtensions:
+        - siderolabs/qemu-guest-agent
+        - siderolabs/amd-ucode
+        - siderolabs/util-linux-tools
+        - siderolabs/iscsi-tools
+EOF
+
+export TALOSCONFIG=/home/nasadmin/k8s-cluster-talos/cluster/talosconfig && talosctl -n 192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.31,192.168.1.32 upgrade --image factory.talos.dev/installer/99fb4dc739f1f7b255110f6f3c24ba98ea9903249de72570b22f0150be37650d:v1.11.2 --preserve --wait=false
+```
