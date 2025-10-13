@@ -1526,18 +1526,22 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   fi
   
   echo "Creating namespaces for cert-manager and external-dns..."
+
   kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
 
   echo "Create secrets for cert-manager and external-dns..."
-  kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token=$CLOUDFLARE_TOKEN
-  kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD=$PIHOLE_PASSWORD --from-literal=EXTERNAL_DNS_PIHOLE_SERVER=$PIHOLE_SERVER --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6"
+  kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token=$CLOUDFLARE_TOKEN --dry-run=client -o yaml | kubectl apply -f -
+  
+  kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD=$PIHOLE_PASSWORD --from-literal=EXTERNAL_DNS_PIHOLE_SERVER=$PIHOLE_SERVER --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f -
 
   # Install flux CLI if not present
   echo "Checking if FluxCD CLI is installed..."
-  if [ flux --version ]; then
+  if ! command -v flux &> /dev/null; then
+    echo "Installing FluxCD CLI..."
     curl -s https://fluxcd.io/install.sh | sudo bash
-    . <(flux completion zsh)
+  else
+    echo "FluxCD CLI already installed."
   fi
 
   echo "Bootstrapping FluxCD with GitHub repository..."
@@ -1610,7 +1614,7 @@ fi
 if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
     echo "  kubectl get pods -n argocd"
 fi
-echo ""
+echo "k get pods -A"
 
 # ==============================================================================
 # Disable cleanup trap on successful completion
