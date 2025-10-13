@@ -1,0 +1,65 @@
+machine:
+  install:
+    image: factory.talos.dev/installer/${SCHEMATIC_ID}:v1.11.2
+  network:
+    hostname: ${NODE_NAME}
+    interfaces:
+      - deviceSelector:
+          hardwareAddr: ${MAC}
+        dhcp: false
+        addresses:
+          - ${IP}/24
+        routes:
+          - network: 0.0.0.0/0
+            gateway: ${GATEWAY}
+    nameservers: ${NAMESERVERS_ARRAY}
+  time:
+    servers:
+      - 192.168.1.1
+      - time.cloudflare.com
+  kubelet:
+    extraMounts:
+      - destination: /var/lib/longhorn
+        type: bind
+        source: /var/lib/longhorn
+        options:
+          - bind
+          - rshared
+          - rw
+    clusterDNS:
+      - 10.96.0.10
+    extraConfig:
+      allowedUnsafeSysctls:
+        - net.*
+        - kernel.msg*
+        - kernel.shm*
+        - kernel.sem
+  nodeLabels:
+    node-role.kubernetes.io/worker: worker
+  sysctls:
+    vm.nr_hugepages: "1024"
+    net.ipv4.ip_forward: "1"
+    net.bridge.bridge-nf-call-iptables: "1"
+    net.ipv6.conf.all.forwarding: "1"
+  kernel:
+    modules:
+      - name: br_netfilter
+      - name: overlay
+      - name: nvme_tcp
+      - name: vfio_pci
+  nodeLabels:
+    node-role.kubernetes.io/worker: worker
+  files:
+    - content: |
+        [metrics]
+        address = "0.0.0.0:11234"
+        grpc_histogram = false
+      path: /var/cri/conf.d/metrics.toml
+      op: create
+cluster:
+  network:
+    cni:
+      name: none
+  proxy:
+    disabled: true
+  allowSchedulingOnControlPlanes: false

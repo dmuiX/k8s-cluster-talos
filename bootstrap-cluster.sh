@@ -333,7 +333,14 @@ download_and_verify() {
     local pattern="$5"
     local use_sudo="${6:-false}"
     local fatal="${7:-true}"
+
+    echo "==> Checking ${name}..."
     
+    if [ -f "$dest" ]; then
+        echo "${name} already exists."
+        return 0
+    fi
+
     local cmd_prefix=""
     if [ "$use_sudo" = "true" ]; then
         cmd_prefix="$SUDO"
@@ -551,32 +558,11 @@ fi
 generate_patch_files_by_role() {
     local role=$1
     
-    echo -e "\nCreating configurations for ${role}s:"
-    
-    # Read nodes from YAML, convert to JSON for easier parsing
-    yq e ".nodes[] | select(.role == \"${role}\")" "$NODES_FILE_PATH" -o=json -I=0 | jq -c '.' | \
-    while read -r node_json; do
-        local mac name ip gateway nameservers
-        
-        # Extract node properties from JSON
-        name=$(echo "$node_json" | jq -r '.name')
-        export name
-        
-        # Get MAC address from Terraform output (needed for hardware selector)
-        mac=$(cd $VMS_DIR && terraform output -json | jq -r --arg NAME "$name" \
-            '.node_macs.value | to_entries[] | select(.key==$NAME) | .value | ascii_downcase')
-        ip=$(echo "$node_json" | jq -r '.ip')
-        gateway=$(echo "$node_json" | jq -r '.gateway')
-        nameservers=$(echo "$node_json" | jq -r '.nameservers | join(",")')
-        
-        local patch_file="./node-configs/${name}-network-patch.yaml"
-        echo "  ✓ ${name} network patch → ${patch_file}"
-        
-        # necessary to write it like that because EOF isnt working any other way!
-        # Create schematic YAML defining required extensions
-        local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
-            -H "Content-Type: application/yaml" \
-            --data-binary @- <<'EOF' | jq -r '.id'
+    # necessary to write it like that because EOF isnt working any other way!
+    # Create schematic YAML defining required extensions
+    local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
+        -H "Content-Type: application/yaml" \
+        --data-binary @- <<'EOF' | jq -r '.id'
 customization:
     systemExtensions:
         officialExtensions:
@@ -586,101 +572,62 @@ customization:
         - siderolabs/iscsi-tools
 EOF
 )
+    if [ -z "$schematic_id" ] || [ "$schematic_id" == "null" ]; then
+        echo "Error: Could not create Talos schematic for custom ISO." >&2
+        exit 1
+    fi
+
+    echo -e "\nCreating configurations for ${role}s:"
+    
+    # Read nodes from YAML, convert to JSON for easier parsing
+    while read -r node_json; do
+        local name ip gateway mac
+        
+        # Extract node properties from JSON
+        name=$(echo "$node_json" | jq -r '.name')
+        ip=$(echo "$node_json" | jq -r '.ip')
+        gateway=$(echo "$node_json" | jq -r '.gateway')
+        # Get MAC address from Terraform output (needed for hardware selector)
+        mac=$(cd "$VMS_DIR" && terraform output -json | jq -r --arg NAME "$name" \
+            '.node_macs.value | to_entries[] | select(.key==$NAME) | .value | ascii_downcase')
+        
+        local patch_file="./node-configs/${name}-network-patch.yaml"
+        echo "  ✓ ${name} network patch → ${patch_file}"
+
+        local template_file base_config
+        if [ "$role" == "control-node" ]; then
+            template_file="$pwd/templates/control-node-patch.yaml"
+            base_config="controlplane.yaml"
+        else
+            template_file="$pwd/templates/worker-node-patch.yaml"
+            base_config="worker.yaml"
+        fi
 
         # Export variables for yq to use in YAML generation
+        # envsubst will replace string placeholders like ${NODE_NAME}.
         export SCHEMATIC_ID="$schematic_id"
+        export NODE_NAME="$name"
         export IP="$ip"
         export GATEWAY="$gateway"
         export MAC="$mac"
-        export NAMESERVERS="$nameservers"
 
-        # Generate network patch YAML with static IP configuration
-        # This disables DHCP and sets static IP, routes, nameservers, timezone, and NTP servers
-        # Also configures for Cilium: no default CNI, kube-proxy disabled (Cilium replaces it)
-        # Sets hostname to node name for proper Kubernetes node identification
-        # Adds appropriate node role labels
-        
-        # Set role-specific environment variable for yq
-        if [ "$role" == "control-node" ]; then
-            export NODE_ROLE_LABEL=""  # Control plane nodes get their role automatically
-        else
-            export NODE_ROLE_LABEL="worker"
-        fi
+        # Export the nameservers as a JSON array string.
+        # The outer quotes are crucial to assign the whole array as one variable.
+        export NAMESERVERS_ARRAY="$(echo "$node_json" | jq '.nameservers')"
 
-        # Generate network patch based on role
-        if [ "$role" == "control-node" ]; then
-            yq e -n '
-              .machine.install.image = "factory.talos.dev/installer/" + strenv(SCHEMATIC_ID) + ":v1.11.2" |
-              .machine.network.hostname = env(name) |
-              .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
-              .machine.network.interfaces[0].dhcp = false |
-              .machine.network.interfaces[0].addresses = [env(IP) + "/24"] |
-              .machine.network.interfaces[0].routes = [{"network": "0.0.0.0/0", "gateway": env(GATEWAY)}] |
-              .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
-              .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
-              .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
-              .machine.kubelet.clusterDNS = [ "10.96.0.10" ] |
-              .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
-              .machine.kubelet.extraArgs.rotate-server-certificates = true |
-              .machine.sysctls.vm.nr_hugepages = "1024" |
-              .machine.sysctls."net.ipv4.ip_forward" = "1" |
-              .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
-              .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
-              .machine.kernel.modules = [ {"name": "br_netfilter"}, {"name": "overlay"}, {"name": "nvme_tcp"}, {"name": "vfio_pci"} ]
-              .cluster.apiServer.admissionControl[0].name = "PodSecurity" |
-              .cluster.apiServer.admissionControl[0].configuration.apiVersion = "pod-security.admission.config.k8s.io/v1" |
-              .cluster.apiServer.admissionControl[0].configuration.kind = "PodSecurityConfiguration" |
-              .cluster.apiServer.admissionControl[0].configuration.defaults.enforce = "baseline" |
-              .cluster.apiServer.admissionControl[0].configuration.defaults."enforce-version" = "latest" |
-              .cluster.apiServer.admissionControl[0].configuration.defaults.audit = "restricted" |
-              .cluster.apiServer.admissionControl[0].configuration.defaults."audit-version" = "latest" |
-              .cluster.apiServer.admissionControl[0].configuration.defaults.warn = "restricted" |
-              .cluster.apiServer.admissionControl[0].configuration.defaults."warn-version" = "latest" |
-              .cluster.apiServer.admissionControl[0].configuration.exemptions.usernames = [] |
-              .cluster.apiServer.admissionControl[0].configuration.exemptions.runtimeClasses = [] |
-              .cluster.apiServer.admissionControl[0].configuration.exemptions.namespaces = ["cilium"] |
-              .cluster.network.cni.name = "none" |
-              .cluster.proxy.disabled = true |
-              .cluster.allowSchedulingOnControlPlanes = true |
-              .cluster.extraManifests= [ "https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/standalone-install.yaml", "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml" ] |
-              .machine.files = [{ "content": "[metrics]\naddress = \"0.0.0.0:11234\"\ngrpc_histogram = false", "path": "/var/cri/conf.d/metrics.toml", "op": "create"}]
-            ' > "$patch_file"
-        else
-            yq e -n '
-              .machine.install.image = "factory.talos.dev/installer/" + strenv(SCHEMATIC_ID) + ":v1.11.2" |
-              .machine.network.hostname = env(name) |
-              .machine.network.interfaces[0].deviceSelector.hardwareAddr = env(MAC) |
-              .machine.network.interfaces[0].dhcp = false |
-              .machine.network.interfaces[0].addresses = [env(IP) + "/24"] |
-              .machine.network.interfaces[0].routes = [{"network": "0.0.0.0/0", "gateway": env(GATEWAY)}] |
-              .machine.network.nameservers = (env(NAMESERVERS) | split(",")) |
-              .machine.time.servers = ["192.168.1.1", "time.cloudflare.com"] |
-              .machine.kubelet.extraMounts = [{"destination": "/var/lib/longhorn", "type": "bind", "source": "/var/lib/longhorn", "options": ["bind", "rshared", "rw"]}] |
-              .machine.kubelet.clusterDNS = ["10.96.0.10"] |
-              .machine.kubelet.extraConfig.allowedUnsafeSysctls = ["net.*", "kernel.msg*", "kernel.shm*", "kernel.sem"] |
-              .machine.sysctls.vm.nr_hugepages = "1024" |
-              .machine.sysctls."net.ipv4.ip_forward" = "1" |
-              .machine.sysctls."net.bridge.bridge-nf-call-iptables" = "1" |
-              .machine.sysctls."net.ipv6.conf.all.forwarding" = "1" |
-              .machine.kernel.modules = [ {"name": "br_netfilter"}, {"name": "overlay"}, {"name": "nvme_tcp"}, {"name": "vfio_pci"} ]
-              .machine.nodeLabels."node-role.kubernetes.io/worker" = "worker" |
-              .cluster.network.cni.name = "none" |
-              .cluster.proxy.disabled = true |
-              .cluster.allowSchedulingOnControlPlanes = false | 
-              .machine.files = [{ "content": "[metrics]\naddress = \"0.0.0.0:11234\"\ngrpc_histogram = false", "path": "/var/cri/conf.d/metrics.toml", "op": "create"}]
-            ' > "$patch_file"
-        fi
-        
-        # Determine base config file based on role
-        if [ "$role" == "control-node" ]; then
-            local base_config="controlplane.yaml"
-        else
-            local base_config="worker.yaml"
-        fi
-        
-        # Apply network patch to base config to create final node-specific config
-        talosctl machineconfig patch "$base_config" --patch @"$patch_file" --output $name-patched.yaml
-    done
+        # This command performs two actions:
+        # 1. `(.. | select(tag == "!!str")) |= envsubst`: Replaces all string
+        #    placeholders like `${IP}` and `${MAC}`. This will also incorrectly
+        #    turn `nameservers: ${NAMESERVERS_ARRAY}` into a string.
+        # 2. `... | .machine.network.nameservers = ...`: This second part FIXES the nameservers
+        #    field by overwriting it with a properly parsed and formatted block-style array.
+        yq '(.. | select(tag == "!!str")) |= envsubst | 
+            .machine.network.nameservers = (env(NAMESERVERS_ARRAY) | .. style="")' \
+          "$template_file" > "$patch_file"
+                        
+        # Apply patch
+        talosctl machineconfig patch "$base_config" --patch @"$patch_file" --output "$name-patched.yaml"
+    done < <(yq e ".nodes[] | select(.role == \"${role}\")" "$NODES_FILE_PATH" -o=json -I=0 | jq -c '.')
 }
 
 # ==============================================================================
@@ -1577,6 +1524,10 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
     rm kubectl
   fi
+  
+  echo "Creating namespaces for cert-manager and external-dns..."
+  kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
 
   echo "Create secrets for cert-manager and external-dns..."
   kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token=$CLOUDFLARE_TOKEN
