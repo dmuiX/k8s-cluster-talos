@@ -1544,15 +1544,41 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     echo "FluxCD CLI already installed."
   fi
 
-  echo "Bootstrapping FluxCD with GitHub repository..."
-  flux bootstrap github \
-    --token-auth \
-    --owner=$GITHUB_REPO_OWNER \
-    --repository=$GITHUB_REPO \
-    --branch=main \
-    --path=clusters \
-    --personal \
-    --private=true
+  RETRIES=3
+  SLEEP_INTERVAL=15
+  COUNTER=0
+
+  while [[ $COUNTER -lt $RETRIES ]]; do
+    echo "Checking Flux GitRepository reconciliation status..."
+    STATUS=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "NotFound")
+
+    if [[ "$STATUS" == "True" ]]; then
+      echo "Flux GitRepository reconciled successfully."
+      break
+    else
+      echo "Flux GitRepository not reconciled yet. Attempt $((COUNTER+1)) of $RETRIES."
+      ((COUNTER++))
+      sleep $SLEEP_INTERVAL
+    fi
+  done
+
+  if [[ "$STATUS" != "True" ]]; then
+    echo "GitRepository failed to reconcile after $RETRIES attempts. Cleaning up and retrying bootstrap..."
+
+    # Delete gitrepository and secrets to force refresh
+    kubectl -n flux-system delete gitrepositories.source.toolkit.fluxcd.io flux-system
+    kubectl -n flux-system delete secret flux-system
+
+    echo "Re-running Flux bootstrap..."
+    flux bootstrap github \
+      --token-auth \
+      --owner=$GITHUB_REPO_OWNER \
+      --repository=$GITHUB_REPO \
+      --branch=main \
+      --path=clusters \
+      --personal \
+      --private=true
+  fi
   
   echo ""
   echo "✓ FluxCD repo ${GITHUB_REPO_OWNER}/${GITHUB_REPO} deployed successfully!"
