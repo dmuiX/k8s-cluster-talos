@@ -4,14 +4,14 @@ terraform {
     organization = "dmuiX"
     workspaces {
       name = "k8s-cluster-talos"
-    }   
+    }
   }
   required_providers {
-    cloudflare = { 
-      source  = "cloudflare/cloudflare"
-      version = "~> 5"
-    }   
-    libvirt = { 
+    pihole = {
+      source  = "ryanwholey/pihole"
+      version = "2.0.0-beta.1"
+    }
+    libvirt = {
       source  = "dmacvicar/libvirt"
       version = "~>0.8.3"
     }
@@ -19,8 +19,9 @@ terraform {
   }
 }
 
-provider "cloudflare" {
-  api_token = var.cloudflare_api_token
+provider "pihole" {
+  password = var.pihole_password
+  url      = var.pihole_server
 }
 
 provider "libvirt" {

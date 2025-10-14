@@ -1,18 +1,13 @@
-output "zone_id" {
-  description = "The Cloudflare Zone ID"
-  value       = data.cloudflare_zone.cloudflare_zone.zone_id
-}
-
 output "domain_name" {
   description = "The main domain name used for DNS records"
-  value       = var.cloudflare_zone_name
+  value       = var.domain_name
 }
 
 output "dns_records" {
   description = "A map of the created DNS records."
   value = {
-    for name, content in cloudflare_dns_record.node_dns :
-    name => content
+    for name, ip in pihole_dns_record.record :
+    name => ip
   }
 }
 

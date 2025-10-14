@@ -1,16 +1,21 @@
-variable "cloudflare_api_token" {
-  description = "The Cloudflare API token."
+variable "pihole_password" {
+  description = "The password for the Pi-hole web interface."
   type        = string
   sensitive   = true
 }
 
-variable "libvirt_uri" {
-  description = "The connection URI for the libvirt daemon. Defaults to 'qemu:///system' for local KVM."
+variable "pihole_server" {
+  description = "The URL of the Pi-hole instance (e.g., http://pihole.local/admin)."
   type        = string
 }
 
-variable "cloudflare_zone_name" {
-  description = "The domain name to manage in Cloudflare."
+variable "domain_name" {
+  description = "The domain name to manage in Pi-hole (e.g., example.local)."
+  type        = string
+}
+
+variable "libvirt_uri" {
+  description = "The connection URI for the libvirt daemon. Defaults to 'qemu:///system' for local KVM."
   type        = string
 }
 
