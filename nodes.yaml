@@ -5,7 +5,7 @@ nodes:
     nameservers:
       - "192.168.1.253"
       - "192.168.1.1"
-    vcpus: 1
+    vcpus: 2
     memory_mib: 1024
     disk_size_gib: 20
     role: "haproxy"
@@ -16,7 +16,7 @@ nodes:
     nameservers:
       - "192.168.1.253"
       - "192.168.1.1"
-    vcpus: 2
+    vcpus: 4
     memory_mib: 4096
     disk_size_gib: 10
     role: "control-node"
@@ -27,7 +27,7 @@ nodes:
     nameservers:
       - "192.168.1.253"
       - "192.168.1.1"
-    vcpus: 2
+    vcpus: 4
     memory_mib: 4096
     disk_size_gib: 10
     role: "control-node"
@@ -38,7 +38,7 @@ nodes:
     nameservers:
       - "192.168.1.253"
       - "192.168.1.1"
-    vcpus: 2
+    vcpus: 4
     memory_mib: 4096
     disk_size_gib: 10
     role: "control-node"
