@@ -16,3 +16,5 @@ terraform.tfstate
 *talosconfig*
 *worker.yaml*
 *controlplane.yaml*
+
+openbao-cretentials.txt
