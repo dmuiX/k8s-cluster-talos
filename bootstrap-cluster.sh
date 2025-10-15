@@ -37,6 +37,7 @@
 #     --skip-cilium-installation  Skip Cilium CNI installation
 #     --skip-argocd-installation  Skip ArgoCD installation
 #     --skip-fluxcd-installation  Skip FluxCD installation
+#     --skip-init-openbao  Skip initializing OpenBao
 #     --debug                 Enable verbose bash debug mode (set -x)
 #     --no-cleanup            Disable automatic terraform destroy on error
 #     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
@@ -57,18 +58,19 @@ Talos Kubernetes Cluster Bootstrap Script
 Automates the complete setup of a Talos Linux Kubernetes cluster on KVM/libvirt.
 
 OPTIONS:
-    -h, --help              Show this help message and exit
-    --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
-    --skip-terraform        Skip VM creation (use existing VMs)
-    --skip-config-creation  Skip generating Talos configs (use existing configs)
-    --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
+    -h, --help                  Show this help message and exit
+    --skip-iso-download         Skip downloading Talos ISO and Ubuntu image
+    --skip-terraform            Skip VM creation (use existing VMs)
+    --skip-config-creation      Skip generating Talos configs (use existing configs)
+    --skip-bootstrap            Skip cluster bootstrap (use existing cluster)
     --skip-cilium-installation  Skip Cilium CNI installation
     --skip-argocd-installation  Skip ArgoCD installation
     --skip-fluxcd-installation  Skip FluxCD installation
-    --debug                 Enable verbose bash debug mode (set -x)
-    --no-cleanup            Disable automatic terraform destroy on error
-    --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
-    --cleanup-all           Complete cleanup: VMs + DNS (terraform destroy)
+    --skip-init-openbao         Skip initializing OpenBao
+    --debug                     Enable verbose bash debug mode (set -x)
+    --no-cleanup                Disable automatic terraform destroy on error
+    --cleanup-vms               Destroy only VMs (keeps Cloudflare DNS records)
+    --cleanup-all               Complete cleanup: VMs + DNS (terraform destroy)
 
 EXAMPLES:
     # Full cluster setup (first time)
@@ -235,6 +237,7 @@ SKIP_BOOTSTRAP=false
 SKIP_CILIUM_INSTALLATION=false
 SKIP_ARGOCD_INSTALLATION=true
 SKIP_FLUXCD_INSTALLATION=false
+SKIP_INIT_OPENBAO=false
 DEBUG=false
 
 for arg in "$@"; do
@@ -264,6 +267,14 @@ for arg in "$@"; do
             ;;
         --skip-argocd-installation)
             SKIP_ARGOCD_INSTALLATION=true
+            shift
+            ;;
+        --skip-fluxcd-installation)
+            SKIP_FLUXCD_INSTALLATION=true
+            shift
+            ;;
+        --skip-init-openbao)
+            SKIP_INIT_OPENBAO=true
             shift
             ;;
         --debug)
@@ -1513,30 +1524,46 @@ fi
 if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 
   echo -e "\n==> Step 12: Installing FluxCD ..."
-  # Wait for cluster to be ready
+  
+  # Wait for the cluster to be ready
   echo "Waiting for cluster to be ready..."
-  kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || echo "⚠ Nodes may still be initializing"
+  if kubectl wait --for=condition=Ready nodes --all --timeout=300s; then
+    echo "✅ All nodes are Ready."
+  else
+    echo "⚠️ Timed out waiting for all nodes to be Ready. Continuing, but some components may fail."
+  fi
 
-  # Install kubectl if not present
+  # Check for kubectl installation
   echo "Checking if kubectl is installed..."
-  if [ kubectl version ]; then
+  if ! command -v kubectl &> /dev/null; then
+    echo "kubectl not found, installing..."
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
     sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
     rm kubectl
+  else
+    echo "kubectl is already installed."
   fi
-  
-  echo "Creating namespaces for cert-manager and external-dns..."
 
+  # Verify required environment variables
+  echo "Verifying required environment variables..."
+  : "${CLOUDFLARE_API_TOKEN:?Error: CLOUDFLARE_API_TOKEN is not set.}"
+  : "${PIHOLE_PASSWORD:?Error: PIHOLE_PASSWORD is not set.}"
+  : "${PIHOLE_SERVER:?Error: PIHOLE_SERVER is not set.}"
+  : "${GITHUB_REPO_OWNER:?Error: GITHUB_REPO_OWNER is not set.}"
+  : "${GITHUB_REPO:?Error: GITHUB_REPO is not set.}"
+
+  # Create necessary namespaces and secrets
+  echo "Creating namespaces and secrets..."
   kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
-
-  echo "Create secrets for cert-manager and external-dns..."
-  kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token=$CLOUDFLARE_TOKEN --dry-run=client -o yaml | kubectl apply -f -
   
-  kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD=$PIHOLE_PASSWORD --from-literal=EXTERNAL_DNS_PIHOLE_SERVER=$PIHOLE_SERVER --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - \
+    || { echo "❌ Failed to create/update cloudflare-token secret."; exit 1; }
 
-  # Install flux CLI if not present
-  echo "Checking if FluxCD CLI is installed..."
+  kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f - \
+    || { echo "❌ Failed to create/update pihole secret."; exit 1; }
+
+  # Check for FluxCD CLI
   if ! command -v flux &> /dev/null; then
     echo "Installing FluxCD CLI..."
     curl -s https://fluxcd.io/install.sh | sudo bash
@@ -1544,44 +1571,59 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     echo "FluxCD CLI already installed."
   fi
 
-  RETRIES=3
-  SLEEP_INTERVAL=15
+  # --- CHANGE 1: Run `flux bootstrap` BEFORE checking for reconciliation ---
+  # The bootstrap command is idempotent and will create the GitRepository.
+  # This is the main fix for the "not found" error.
+  echo "--> Running Flux bootstrap..."
+  flux bootstrap github \
+    --token-auth \
+    --owner="$GITHUB_REPO_OWNER" \
+    --repository="$GITHUB_REPO" \
+    --branch=main \
+    --path=clusters \
+    --personal \
+    --private=true || {
+      echo "❌ Flux bootstrap command failed. Check repository access and controller logs."
+      echo "   Debug with: kubectl -n flux-system logs -l app=source-controller"
+      exit 1
+    }
+
+  # --- CHANGE 2: Use the loop as a post-bootstrap VERIFICATION step ---
+  # Now that bootstrap has run, this loop confirms the system becomes healthy.
+  RETRIES=10
+  SLEEP_INTERVAL=30
   COUNTER=0
+  STATUS=""
 
+  echo "--> Verifying Flux GitRepository reconciliation status after bootstrap..."
   while [[ $COUNTER -lt $RETRIES ]]; do
-    echo "Checking Flux GitRepository reconciliation status..."
-    STATUS=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "NotFound")
-
+    echo "    (Attempt $((COUNTER+1))/$RETRIES)..."
+    
+    STATUS=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    
     if [[ "$STATUS" == "True" ]]; then
-      echo "Flux GitRepository reconciled successfully."
+      echo "✅ Flux GitRepository is reconciled and ready."
       break
     else
-      echo "Flux GitRepository not reconciled yet. Attempt $((COUNTER+1)) of $RETRIES."
-      ((COUNTER++))
-      sleep $SLEEP_INTERVAL
+      MESSAGE=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "GitRepository status not yet available.")
+      echo "    Status: Not Ready. Waiting..."
+      echo "    Message: $MESSAGE"
     fi
+    
+    ((COUNTER++))
+    sleep $SLEEP_INTERVAL
   done
 
+  # If the loop completes and the status is still not ready, fail gracefully.
   if [[ "$STATUS" != "True" ]]; then
-    echo "GitRepository failed to reconcile after $RETRIES attempts. Cleaning up and retrying bootstrap..."
-
-    # Delete gitrepository and secrets to force refresh
-    kubectl -n flux-system delete gitrepositories.source.toolkit.fluxcd.io flux-system
-    kubectl -n flux-system delete secret flux-system
-
-    echo "Re-running Flux bootstrap..."
-    flux bootstrap github \
-      --token-auth \
-      --owner=$GITHUB_REPO_OWNER \
-      --repository=$GITHUB_REPO \
-      --branch=main \
-      --path=clusters \
-      --personal \
-      --private=true
+    echo "❌ GitRepository failed to become Ready after bootstrap and $RETRIES attempts."
+    echo "   Please investigate the source-controller logs for errors:"
+    echo "   kubectl -n flux-system logs -l app=source-controller"
+    exit 1
   fi
   
   echo ""
-  echo "✓ FluxCD repo ${GITHUB_REPO_OWNER}/${GITHUB_REPO} deployed successfully!"
+  echo " ✓ FluxCD repo ${GITHUB_REPO_OWNER}/${GITHUB_REPO} deployed and reconciled successfully!"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 else
     echo -e "\n==> Step 12: Skipping FluxCD installation as requested."
@@ -1602,6 +1644,208 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
   fi
 
   echo "  ✓ Kept: talosconfig, secrets.yaml, controlplane.yaml, worker.yaml and *-patched.yaml files"
+fi
+
+# =============================================================================
+# 13: Initialize Openbao
+# =============================================================================
+
+# --- Helper Functions for Logging ---
+info() { echo -e "==> $*"; }
+success() { echo -e "✓ $*"; }
+error() { echo -e "❌ Error: $*" >&2; exit 1; }
+
+# --- Spinner and Wait Function ---
+# --- Spinner and Wait Function ---
+wait_with_spinner() {
+    local msg="$1"; shift; local cmd=("$@")
+    
+    # Run command in background
+    "${cmd[@]}" &> /dev/null &
+    local cmd_pid=$!
+
+    # Simple spinner animation
+    tput civis
+    local spin_chars='/-\|'
+    local i=0
+    echo -n "$msg "
+    
+    while kill -0 $cmd_pid 2>/dev/null; do
+        printf "%s" "${spin_chars:i++%${#spin_chars}:1}"
+        sleep 0.2
+        printf "\b"
+    done
+    
+    tput cnorm
+    wait $cmd_pid
+    local exit_code=$?
+    
+    if [ "$exit_code" -eq 0 ]; then
+        echo "✓"
+    else
+        echo "❌"
+        error "Previous step failed."
+    fi
+}
+
+# --- Main Logic Functions ---
+
+ensure_cli_tools_installed() {
+  info "Checking for required tools (kubectl, yq, openssl)..."
+  for cmd in kubectl yq openssl; do
+      if ! command -v "$cmd" &> /dev/null; then
+          error "'$cmd' is not installed or not in your PATH."
+      fi
+  done
+  success "All required tools are present."
+}
+
+ensure_flux_dependencies_ready() {
+    # wait for 20 seconds to allow initial reconciliation
+    sleep 20
+    info "Ensuring OpenBao's Flux dependencies are ready..."
+    local dependencies=("cilium" "cert-manager" "longhorn")
+    
+    for dep in "${dependencies[@]}"; do
+        echo "==> Waiting for $dep HelmRelease..."
+        kubectl wait --for=condition=Ready "helmrelease/$dep" \
+            -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
+
+        sleep 5
+
+        # NEW: Wait for actual pods
+        echo "==> Waiting for $dep pods..."
+        case "$dep" in
+            cilium)
+                kubectl wait --for=condition=Ready pod -l k8s-app=cilium \
+                    -n cilium --timeout=5m
+                ;;
+            cert-manager)
+                kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=cert-manager \
+                    -n cert-manager --timeout=5m
+                ;;
+            longhorn)
+                kubectl wait --for=condition=Ready pod -l app=longhorn-manager \
+                    -n longhorn --timeout=5m
+                ;;
+        esac
+        
+        echo "✓ $dep ready"
+    done
+}
+
+get_config_from_helmrelease() {
+  info "Looking for HelmRelease '${HELMRELEASE_NAME}' in namespace '${HELMRELEASE_NAMESPACE}'..."
+  
+  local retries=10
+  local wait=5
+  for ((i=1; i<=retries; i++)); do
+      if kubectl get helmrelease "${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" &> /dev/null; then
+          success "HelmRelease found."
+          break
+      fi
+      if [[ $i -eq $retries ]]; then
+          error "HelmRelease '${HELMRELEASE_NAME}' not found after ${retries} attempts."
+      fi
+      echo "    (Attempt $i/${retries}) Not found yet. Retrying in ${wait} seconds..."
+      sleep $wait
+  done
+
+  wait_with_spinner "Waiting for Flux to process the HelmRelease spec..." \
+      kubectl wait --for=jsonpath='{.status.observedGeneration}' \
+      "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=2m
+
+  info "Reading configuration from HelmRelease spec..."
+  local hr_yaml
+  hr_yaml=$(kubectl get helmrelease "${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" -o yaml)
+
+  export NAMESPACE=$(echo "$hr_yaml" | yq e '.spec.targetNamespace' -)
+  export SECRET_NAME=$(echo "$hr_yaml" | yq e '.spec.values.server.volumes[0].secret.secretName' -)
+  export SECRET_KEY_NAME=$(echo "$hr_yaml" | yq e '.spec.values.server.volumes[0].secret.items[0].key' -)
+
+  if [[ -z "$NAMESPACE" || -z "$SECRET_NAME" || -z "$SECRET_KEY_NAME" ]]; then
+      error "Failed to read config. Check .spec.targetNamespace and .spec.values.server.volumes."
+  fi
+}
+
+create_unseal_secret() {
+  info "Generating static key and creating secret '${SECRET_NAME}' in '${NAMESPACE}'..."
+  openssl rand 32 | kubectl create secret generic "${SECRET_NAME}" \
+      --namespace="${NAMESPACE}" \
+      --from-file="${SECRET_KEY_NAME}=/dev/stdin" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  success "Secret created. Flux will now reconcile the release."
+}
+
+initialize_bao() {
+  wait_with_spinner "Waiting for HelmRelease to become ready after secret creation..." \
+      kubectl wait --for=condition=ready "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
+
+  local pod_selector="app.kubernetes.io/name=openbao"
+  wait_with_spinner "Waiting for an OpenBao pod to become ready..." \
+      kubectl -n "${NAMESPACE}" wait --for=jsonpath='{.status.phase}'=Running pod -l "${pod_selector}" --timeout=5m
+
+  local pod_name
+  pod_name=$(kubectl get pods -n "${NAMESPACE}" -l "${pod_selector}" -o jsonpath='{.items[0].metadata.name}')
+  success "Found pod '${pod_name}' to perform initialization."
+
+  local init_status
+  init_status=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+  curl -s http://127.0.0.1:8200/v1/sys/init | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
+
+  info "Checking OpenBao initialization status on pod '${pod_name}'..."
+  if [[ "$init_status" == "true" ]]; then
+      success "OpenBao is already initialized. No action needed."
+  else
+      info "OpenBao is not initialized. Running 'bao operator init' with recovery keys..."
+      local init_output
+      init_output=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" \
+      -- bao operator init \
+      -recovery-shares=5 \
+      -recovery-threshold=3 2>&1)
+      echo -e "\n--- [ OpenBao Initialization Output ] ---\n${init_output}\n-----------------------------------------"
+      echo "${init_output}" > "${OUTPUT_FILE}"
+      success "Initialization complete. Credentials saved to '${OUTPUT_FILE}'."
+      info "IMPORTANT: The file '${OUTPUT_FILE}' contains your root token and recovery keys. Secure it immediately."
+  fi
+}
+
+# --- Script Execution Logic ---
+
+if [ "$SKIP_INIT_OPENBAO" = false ]; then
+  # A fully dynamic and robust script to initialize an auto-unsealing OpenBao cluster,
+  # featuring a corrected, safe spinner and conditional execution block.
+
+  # --- User-Configurable Variables ---
+  HELMRELEASE_NAME="openbao"
+  HELMRELEASE_NAMESPACE="flux-system"
+  OUTPUT_FILE="openbao-credentials.txt"
+  
+  cd $pwd
+
+  info "Starting OpenBao initialization process..."
+
+  ensure_cli_tools_installed
+  ensure_flux_dependencies_ready
+
+  get_config_from_helmrelease
+  
+  cat <<-EOF
+
+--- Configuration Discovered ---
+Target Namespace: ${NAMESPACE}
+Secret Name     : ${SECRET_NAME}
+Secret Key Name : ${SECRET_KEY_NAME}
+--------------------------------
+
+EOF
+    
+  create_unseal_secret
+  initialize_bao
+    
+  success "✓ Openbao Cluster sucessfully initialized. Will unseal automatically from now on."
+else
+  echo -e "\n==> Skipping OpenBao initialization as requested."
 fi
 
 # ==============================================================================
@@ -1627,6 +1871,9 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 fi
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
+fi
+if [ "$SKIP_INIT_OPENBAO" = false ]; then
+  echo "   • OpenBao: Initialized with auto-unseal (see openbao-credentials.txt)"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
