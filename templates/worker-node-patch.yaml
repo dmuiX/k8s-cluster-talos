@@ -67,4 +67,3 @@ cluster:
     - https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
     - https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
     - https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml
-    - https://raw.githubusercontent.com/prometheus-operator/kube-prometheus/refs/heads/main/manifests/setup/0servicemonitorCustomResourceDefinition.yaml
