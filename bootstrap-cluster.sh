@@ -132,7 +132,8 @@ cleanup_on_error() {
         if [ -n "${VMS_DIR:-}" ] && [ -d "$VMS_DIR" ]; then
             echo "Running terraform destroy to clean up VMs..."
             cd "$VMS_DIR"
-            terraform destroy -auto-approve
+            cleanup_vms_only
+            # terraform destroy -auto-approve
             echo "✓ VMs destroyed"
         else
             echo "Warning: Could not locate VMS_DIR for cleanup."
@@ -1045,7 +1046,7 @@ echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
 talosctl config endpoint $CONTROL_STATIC_IPS
 
 FIRST_READY=""
-MAX_WAIT=90
+MAX_WAIT=90 # 1m30s
 ELAPSED=0
 
 echo "Checking for first ready control node..."
