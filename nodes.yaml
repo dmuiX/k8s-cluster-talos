@@ -5,8 +5,8 @@ nodes:
     nameservers:
       - "192.168.1.253"
       - "192.168.1.1"
-    vcpus: 2
-    memory_mib: 1024
+    vcpus: 1
+    memory_mib: 768
     disk_size_gib: 20
     role: "haproxy"
 
@@ -17,7 +17,7 @@ nodes:
       - "192.168.1.253"
       - "192.168.1.1"
     vcpus: 4
-    memory_mib: 4096
+    memory_mib: 6144
     disk_size_gib: 10
     role: "control-node"
 
@@ -28,7 +28,7 @@ nodes:
       - "192.168.1.253"
       - "192.168.1.1"
     vcpus: 4
-    memory_mib: 4096
+    memory_mib: 6144
     disk_size_gib: 10
     role: "control-node"
 
@@ -39,7 +39,7 @@ nodes:
       - "192.168.1.253"
       - "192.168.1.1"
     vcpus: 4
-    memory_mib: 4096
+    memory_mib: 6144
     disk_size_gib: 10
     role: "control-node"
 
@@ -50,7 +50,7 @@ nodes:
       - "192.168.1.253"
       - "192.168.1.1"
     vcpus: 4
-    memory_mib: 8192
+    memory_mib: 6144
     disk_size_gib: 255
     role: "worker-node"
 
@@ -61,6 +61,6 @@ nodes:
       - "192.168.1.253"
       - "192.168.1.1"
     vcpus: 4
-    memory_mib: 8192
+    memory_mib: 6144
     disk_size_gib: 255
     role: "worker-node"
