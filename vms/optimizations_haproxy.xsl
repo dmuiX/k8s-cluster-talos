@@ -39,11 +39,10 @@
     </xsl:copy>
   </xsl:template>
 
-
   <!-- CPU configuration -->
   <xsl:template match="cpu">
     <cpu mode="host-passthrough" check="none">
-      <topology sockets="1" cores="2" threads="2"/>
+      <topology sockets="1" cores="1" threads="1"/>
       <feature policy="require" name="topoext"/>
     </cpu>
   </xsl:template>

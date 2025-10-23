@@ -57,7 +57,7 @@ resource "libvirt_domain" "node_domain" {
   }
 
   xml {
-    xslt = file("${path.module}/optimizations.xsl")
+    xslt = each.value.role == "haproxy" ? file("${path.module}/optimizations_haproxy.xsl") : file("${path.module}/optimizations.xsl")
   }
   # lifecycle {
   #   prevent_destroy = var.prevent_destroy
