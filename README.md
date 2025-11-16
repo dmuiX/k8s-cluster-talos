@@ -4,7 +4,7 @@ This repository contains the configuration for a Kubernetes cluster running on T
 
 ## Overview
 
-* **Virtualization:** KVM with Vagrant
+* **Virtualization:** KVM with terraform libvirt provider
 * **Operating System:** Talos
 * **DNS:** Cloudflare (managed with Terraform)
 * **Automation:** Automated node deployment for control plane and worker nodes.
@@ -18,6 +18,8 @@ This repository contains the configuration for a Kubernetes cluster running on T
 * `vagrant/`: Vagrantfile and related scripts for VM provisioning.
 
 ## Vagrant libvirt-provider
+
+does not work
 
 very old version 2 years old!
 
