@@ -13,20 +13,20 @@ install gateway rpcs
 
 ## Add repo
 
- k create secret generic github-creds -n argocd --from-literal=name=github-repo --from-literal=type="git" --from-literal=url="https://github.com/\$GITHUB_REPO_OWNER/argocd.k8sdev.cloud.git"  --from-literal=username="\$GITHUB_REPO_OWNER" --from-literal=password="github_pat_1" --dry-run=client -o yaml | kubectl label --local -f - "argocd.argoproj.io/secret-type=repository" -o yaml | kubectl apply -f -
+ k create secret generic github-creds -n argocd --from-literal=name=github-repo --from-literal=type="git" --from-literal=url="https://github.com/$GITHUB_REPO_OWNER/argocd.k8sdev.cloud.git"  --from-literal=username="$GITHUB_REPO_OWNER" --from-literal=password="github_pat_1" --dry-run=client -o yaml | kubectl label --local -f - "argocd.argoproj.io/secret-type=repository" -o yaml | kubectl apply -f -
 
 
- k create secret generic github-creds -n argocd --from-literal=type="git" --from-literal=url="https://github.com/\$GITHUB_REPO_OWNER/argocd.k8sdev.cloud.git"  --from-literal=username="\$GITHUB_REPO_OWNER" --from-literal=password="[\$GITHUB_REPO_OWNER]" --dry-run=client -o yaml | kubectl label --local -f - "argocd.argoproj.io/secret-type=repository" -o yaml | kubectl apply -f -
+ k create secret generic github-creds -n argocd --from-literal=type="git" --from-literal=url="https://github.com/$GITHUB_REPO_OWNER/argocd.k8sdev.cloud.git"  --from-literal=username="$GITHUB_REPO_OWNER" --from-literal=password="[\$GITHUB_REPO_OWNER]" --dry-run=client -o yaml | kubectl label --local -f - "argocd.argoproj.io/secret-type=repository" -o yaml | kubectl apply -f -
 ## Add github repository to argocd
 
 ```bash
 k apply -f argocd/deployment.yml
 
-k create secret generic github-creds -n argocd --from-literal=username=\$GITHUB_REPO_OWNER --from-literal=token=[\$GITHUB_REPO_OWNER]
+k create secret generic github-creds -n argocd --from-literal=username=$GITHUB_REPO_OWNER --from-literal=token=[\$GITHUB_REPO_OWNER]
 
 kubectl label secret github-creds -n argocd argocd.argoproj.io/secret-type=repository                          ─╯
 
-kubectl patch secret github-creds -n argocd --type='merge' -p='{"stringData":{"type":"git","url":"https://github.com/\$GITHUB_REPO_OWNER/argocd.k8sdev.cloud.git"}}'
+kubectl patch secret github-creds -n argocd --type='merge' -p='{"stringData":{"type":"git","url":"https://github.com/$GITHUB_REPO_OWNER/argocd.k8sdev.cloud.git"}}'
 ```
 
 ## Deploy ArgoCD with olm

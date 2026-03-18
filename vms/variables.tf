@@ -44,3 +44,8 @@ variable "cloudinit_basevolume_url" {
   description = "URL or path to the source image for haproxy (e.g., a cloud image)."
   type        = string
 }
+
+variable "github_owner" {
+  description = "GitHub username or organization for repo URLs and SSH key import."
+  type        = string
+}

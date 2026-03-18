@@ -14,9 +14,11 @@ if [ flux --version ]; then
   . <(flux completion zsh)
 fi
 
+OWNER="${GITHUB_REPO_OWNER:-\$GITHUB_REPO_OWNER}"
+
 flux bootstrap github \
   --token-auth \
-  --owner=\$GITHUB_REPO_OWNER \
+  --owner="$OWNER" \
   --repository=fluxcd.k8sdev.cloud \
   --branch=main \
   --path=clusters \

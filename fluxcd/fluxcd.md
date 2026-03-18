@@ -8,7 +8,7 @@ curl -s https://fluxcd.io/install.sh | sudo bash
 
 flux bootstrap github \
   --token-auth \
-  --owner=\$GITHUB_REPO_OWNER \
+  --owner=$GITHUB_REPO_OWNER \
   --repository=fluxcd.k8sdev.cloud \
   --branch=main \
   --path=clusters \

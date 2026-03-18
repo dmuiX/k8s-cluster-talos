@@ -89,7 +89,7 @@ runcmd:
   - systemctl restart sshd
 
   # Clone dotfiles repo
-  - sudo -u ${username} -H sh -c "git clone https://github.com/\$GITHUB_REPO_OWNER/dotnet-files-linux.git /home/${username}/.dotfiles || true"
+  - sudo -u ${username} -H sh -c "git clone https://github.com/${github_owner}/dotnet-files-linux.git /home/${username}/.dotfiles || true"
 
   # Copy dotfiles
   - sudo -u ${username} -H sh -c "cp /home/${username}/.dotfiles/.* /home/${username}/ 2>/dev/null || true"
@@ -115,5 +115,5 @@ users:
   - name: ${username}
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /usr/bin/zsh
-    ssh_import_id: ['gh:\$GITHUB_REPO_OWNER']
+    ssh_import_id: ['gh:${github_owner}']
     groups: sudo
