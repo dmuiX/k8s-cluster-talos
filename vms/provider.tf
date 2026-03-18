@@ -1,11 +1,5 @@
 terraform {
   required_version = ">= 0.13"
-  cloud {
-    organization = "\$GITHUB_REPO_OWNER"
-    workspaces {
-      name = "k8s-cluster-talos"
-    }   
-  }
   required_providers {
     cloudflare = { 
       source  = "cloudflare/cloudflare"
@@ -15,7 +9,6 @@ terraform {
       source  = "dmacvicar/libvirt"
       version = "~>0.8.3"
     }
-
   }
 }
 

@@ -858,7 +858,7 @@ cd "${CLUSTER_DIR}"
 # Check if talosctl is installed, if not, install it
 if ! command -v talosctl &> /dev/null; then
     echo "Installing talosctl..."
-    curl -sL https://talos.dev/install | sh
+    curl -sL https://talos.dev/install | $SUDO sh
 fi
 # --- Main Script Execution ---
 
@@ -869,10 +869,29 @@ echo "==> Step 2a: Performing pre-flight checks..."
 # - jq: JSON processor for parsing Terraform output
 # - curl: HTTP client for downloads
 # - arp-scan: Network scanner for discovering node IPs
+# - genisoimage/mkisofs: Required by terraform-provider-libvirt for cloud-init ISO creation
+# - openssl: Used for generating secrets
+# - terraform: Infrastructure provisioning
+# - helm: Kubernetes package manager (used by Cilium install)
 if ! command -v yq &> /dev/null; then echo "yq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y yq; fi
 if ! command -v jq &> /dev/null; then echo "jq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y jq; fi
 if ! command -v curl &> /dev/null; then echo "curl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y curl; fi
 if ! command -v arp-scan &> /dev/null; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
+if ! command -v mkisofs &> /dev/null && ! command -v genisoimage &> /dev/null; then
+    echo "genisoimage not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y genisoimage
+fi
+if ! command -v openssl &> /dev/null; then echo "openssl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y openssl; fi
+if ! command -v terraform &> /dev/null; then
+    echo "terraform not found, installing..."
+    $SUDO apt-get update && $SUDO apt-get install -y gnupg lsb-release wget
+    wget -O- https://apt.releases.hashicorp.com/gpg | $SUDO gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | $SUDO tee /etc/apt/sources.list.d/hashicorp.list
+    $SUDO apt-get update && $SUDO apt-get install -y terraform
+fi
+if ! command -v helm &> /dev/null; then
+    echo "helm not found, installing..."
+    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | $SUDO bash
+fi
 
 cd "$CLUSTER_DIR"
 }
@@ -1492,7 +1511,7 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   if ! command -v kubectl &> /dev/null; then
     echo "kubectl not found, installing..."
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    $SUDO install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
     rm kubectl
   else
     echo "kubectl is already installed."
@@ -1691,9 +1710,9 @@ CLEANUP_ON_ERROR=false
 
 # --- main ---
 main() {
+    phase_preflight
     phase_download_images
     phase_create_vms
-    phase_preflight
     phase_generate_configs
     phase_bootstrap
     phase_install_cilium
