@@ -181,6 +181,19 @@ docs/                     Component docs (Cilium, Longhorn, ArgoCD, ...)
 ./bootstrap-cluster.sh --cleanup-all
 ```
 
+## ArgoCD App Deployment Order
+
+When deploying via ArgoCD, install in this order:
+
+1. Kubernetes (base cluster)
+2. Cilium
+3. external-dns
+4. cert-manager
+5. ArgoCD
+6. external-secrets
+7. gateway-api
+8. argocd-apps
+
 ## Notes / Known Issues
 
 **Terraform Cloud — Local Execution required**
