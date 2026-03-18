@@ -14,7 +14,7 @@ if [ flux --version ]; then
   . <(flux completion zsh)
 fi
 
-OWNER="${GITHUB_REPO_OWNER:-\$GITHUB_REPO_OWNER}"
+OWNER="${GITHUB_REPO_OWNER}"
 
 flux bootstrap github \
   --token-auth \
