@@ -1,92 +1,199 @@
-# Talos Kubernetes Cluster
+# k8s-cluster-talos
 
-This repository contains the configuration for a Kubernetes cluster running on Talos.
+Automated Talos Linux Kubernetes cluster on KVM/libvirt.
+One script provisions VMs, installs Talos, bootstraps Kubernetes and sets up the full stack.
 
-## Overview
+## Stack
 
-* **Virtualization:** KVM with Vagrant
-* **Operating System:** Talos
-* **DNS:** Cloudflare (managed with Terraform)
-* **Automation:** Automated node deployment for control plane and worker nodes.
+| Component | Version | Role |
+|-----------|---------|------|
+| Talos Linux | v1.11.2 | Node OS |
+| Kubernetes | v1.34.1 | Orchestration |
+| KVM/libvirt + Terraform | — | VM provisioning |
+| HAProxy | Ubuntu cloud-init | Load balancer (API endpoint) |
+| Cilium | 1.18.2 | CNI, kube-proxy replacement, Gateway API |
+| ArgoCD | v3.0.19 | GitOps (optional) |
+| FluxCD | latest | GitOps (optional) |
+| OpenBao | via FluxCD | Secrets management (optional) |
+| Cloudflare | Terraform provider v5 | DNS |
 
-## Directory Structure
+## Topology
 
-* `cluster/`: Kubernetes manifests and Talos configuration files.
-* `docs/`: Project documentation.
-* `scripts/`: Helper scripts for cluster management.
-* `terraform/`: Terraform configurations for Cloudflare DNS.
-* `vagrant/`: Vagrantfile and related scripts for VM provisioning.
+Defined in `nodes.yaml` (gitignored — copy from `nodes.yaml.example`):
 
-## Vagrant libvirt-provider
+| Node | Role | vCPUs | RAM |
+|------|------|-------|-----|
+| haproxy | Load balancer | 1 | 768 MiB |
+| control-node-{1,2,3} | Control plane | 4 | 6 GiB |
+| worker-node-{1,2} | Worker | 4 | 6 GiB |
 
-very old version 2 years old!
+Kubernetes API endpoint: `https://<haproxy-ip>:6443`
 
-always getting: Call to virConnectListAllInterfaces failed: this function is not supported by the connection driver: virConnectListAllInterfaces (Libvirt::RetrieveError)
+## Prerequisites
 
-and defining a boot order is also not working very well
+- KVM/libvirt installed and running
+- Bridge interface configured (e.g. `br0`)
+- Terraform Cloud account (or local backend) for state
+- Cloudflare account with API token
+- Tools: `yq`, `jq`, `arp-scan`, `talosctl`, `kubectl`
+- `.env` and `nodes.yaml` filled in (see examples below)
 
-        domain.boot 'hd'
-        domain.boot 'cdrom'
-        # domain.boot_order = ['cdrom', 'hd']
-
-## terraform libvirt provider
-
-seems like for any reason this is not working for any reason:
-
-  disk = [
-    {
-      volume_id = libvirt_volume.volume1.id
-    },
-    {
-      volume_id = libvirt_volume.volume2.id
-    }
-  ]
-
-## Error: failed to connect: dial unix /var/run/libvirt/libvirt-sock: connect: no such file or directory
-
-I need to set the terraform cloud to Local Execution!
-
-Default is Remote!
-
-## Shell script attempt
-
-Was trying to use a shell script but thought this will be very demanding to create I want to use sth that is working and can spin up and destroy stuff easy!
-
-## cloudinit works but must be in one line!
-
-## kernel parameter seem to end in kernel panic I will not use it then
-  kernel = each.value.role == "control-node" ? "${path.module}/vmlinuz" : null
-  cmdline = each.value.role == "control-node" ? [{key = "ip", value = "${each.value.ip}::${each.value.gateway}:255.255.255.0::eth0.100:::::"}] : null
-
-## terraform prevent destroy works when remove the block from the tf files...
-this is sooo weird
-cannot set a variable but can remove the block and then apply....wtf.
-
-## deployment on argocd
-
-3. On argocd: 
-    1. install k8s
-    2. install cilium
-    3. install external-dns
-    4. install cert-manager
-    5. install argocd
-    6. install external-secrets
-    7. install gateway-api
-    8. install argocd-apps
-   
-
-## Upgrade or change to custom iso 
+## Quick Start
 
 ```bash
-curl -sX POST "https://factory.talos.dev/schematics" -H "Content-Type: application/vnd.yaml" --data-binary @- <<'EOF' | jq -r '.id'
+# 1. Fill in credentials and topology
+cp .env.example .env && vi .env
+cp nodes.yaml.example nodes.yaml && vi nodes.yaml
+
+# 2. Run the bootstrap (full setup)
+./bootstrap-cluster.sh
+
+# 3. Verify
+kubectl get nodes
+cilium status
+```
+
+If `.env` is missing or incomplete, the script will prompt for the required values interactively.
+
+## `.env` Variables
+
+```bash
+CLUSTER_NAME=talos-cluster
+VMS_DIR=./vms
+CLUSTER_DIR=./cluster
+NODES_FILE_PATH=./nodes.yaml
+
+TALOS_ISO_URL=https://...
+TALOS_CHECKSUM_URL=https://...
+UBUNTU_IMAGE_URL=https://...
+UBUNTU_CHECKSUM_URL=https://...
+METALISO_ABSOLUTE_PATH=./vms/metal-amd64.iso
+UBUNTU_IMAGE_PATH=./vms/ubuntu.img
+
+# Terraform / Cloudflare
+TF_VAR_cloudflare_api_token=...
+TF_VAR_cloudflare_zone_id=...
+TF_CLOUD_ORGANIZATION=...
+
+# FluxCD (optional)
+GITHUB_REPO_OWNER=...
+GITHUB_REPO=...
+GITHUB_TOKEN=...
+
+# External DNS / Pihole (optional)
+PIHOLE_PASSWORD=...
+PIHOLE_SERVER=...
+CLOUDFLARE_API_TOKEN=...
+```
+
+## Options
+
+```
+./bootstrap-cluster.sh [OPTIONS]
+
+  --skip-iso-download         Skip ISO downloads (already present)
+  --skip-terraform            Skip VM creation (VMs already exist)
+  --skip-config-creation      Skip Talos config generation
+  --skip-bootstrap            Skip cluster bootstrap (cluster already running)
+  --skip-cilium-installation  Skip Cilium
+  --skip-argocd-installation  Skip ArgoCD
+  --skip-fluxcd-installation  Skip FluxCD
+  --skip-init-openbao         Skip OpenBao initialization
+
+  --debug                     Enable bash -x tracing
+  --no-cleanup                Disable automatic cleanup on error
+  --cleanup-vms               Destroy VMs only (keep DNS)
+  --cleanup-all               Destroy everything (VMs + DNS)
+```
+
+## Bootstrap Flow
+
+```
+bootstrap-cluster.sh
+  ├─ credentials_prompt       Ask for missing .env vars interactively
+  ├─ phase_download_images    Download Talos ISO + Ubuntu cloud image (SHA256 verified)
+  ├─ phase_create_vms         terraform apply → KVM VMs + Cloudflare DNS
+  ├─ phase_preflight          Install talosctl, yq, jq, arp-scan if missing
+  ├─ phase_generate_configs   talosctl gen-config + node-specific patches via Talos Image Factory
+  ├─ phase_bootstrap
+  │   ├─ Wait for HAProxy on :6443
+  │   ├─ arp-scan → discover DHCP IPs → match to MACs from Terraform
+  │   ├─ Apply configs to all nodes in parallel (talosctl apply-config --mode=reboot)
+  │   ├─ Set boot order: disk first, ISO as fallback
+  │   ├─ Wait for first control node → talosctl bootstrap (etcd init)
+  │   ├─ Wait for remaining control nodes to join
+  │   ├─ Wait for worker nodes
+  │   └─ Retrieve kubeconfig
+  ├─ phase_install_cilium     cilium install (KubePrism 127.0.0.1:7445, Gateway API)
+  ├─ phase_install_argocd     ArgoCD HA mode + Gateway API CRDs (optional)
+  ├─ phase_install_fluxcd     flux bootstrap github (optional)
+  ├─ phase_cleanup_temp       Remove temporary node-config files
+  ├─ phase_init_openbao       Initialize OpenBao with auto-unseal (optional)
+  └─ print_summary
+```
+
+## Upgrade Talos
+
+```bash
+# Generate schematic ID with required extensions
+curl -sX POST "https://factory.talos.dev/schematics" \
+  -H "Content-Type: application/yaml" \
+  --data-binary @- <<'EOF' | jq -r '.id'
 customization:
-    systemExtensions:
-        officialExtensions:
-        - siderolabs/qemu-guest-agent
-        - siderolabs/amd-ucode
-        - siderolabs/util-linux-tools
-        - siderolabs/iscsi-tools
+  systemExtensions:
+    officialExtensions:
+    - siderolabs/qemu-guest-agent
+    - siderolabs/amd-ucode
+    - siderolabs/util-linux-tools
+    - siderolabs/iscsi-tools
 EOF
 
-export TALOSCONFIG=./cluster/talosconfig && talosctl -n 192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.31,192.168.1.32 upgrade --image factory.talos.dev/installer/99fb4dc739f1f7b255110f6f3c24ba98ea9903249de72570b22f0150be37650d:v1.11.2 --preserve --wait=false
+# Upgrade all nodes
+export TALOSCONFIG=./cluster/talosconfig
+talosctl -n <control-1>,<control-2>,<control-3>,<worker-1>,<worker-2> \
+  upgrade --image factory.talos.dev/installer/<schematic-id>:v1.11.2 \
+  --preserve --wait=false
 ```
+
+## File Structure
+
+```
+bootstrap-cluster.sh      Main orchestration script
+nodes.yaml                Cluster topology (gitignored — copy from nodes.yaml.example)
+nodes.yaml.example        Example topology
+templates/                Talos machine config patches (control + worker)
+vms/                      Terraform: KVM domains, HAProxy, Cloudflare DNS
+cluster/                  Generated Talos configs (gitignored)
+argocd/                   ArgoCD Application manifest
+fluxcd/                   FluxCD bootstrap config
+scripts/                  Helper scripts (boot order, YAML validation)
+docs/                     Component docs (Cilium, Longhorn, ArgoCD, ...)
+.env                      Credentials (gitignored, never commit)
+```
+
+## Cleanup
+
+```bash
+# Remove VMs only (keep Cloudflare DNS)
+./bootstrap-cluster.sh --cleanup-vms
+
+# Remove everything (VMs + DNS records)
+./bootstrap-cluster.sh --cleanup-all
+```
+
+## Notes / Known Issues
+
+**Terraform Cloud — Local Execution required**
+The libvirt provider doesn't work with Remote execution. Set the workspace to _Local Execution_ in Terraform Cloud settings, otherwise you'll get:
+```
+Error: failed to connect: dial unix /var/run/libvirt/libvirt-sock: connect: no such file or directory
+```
+
+**cloud-init config must be a single line**
+Multi-line cloud-init user data breaks with the libvirt Terraform provider — keep it inline.
+
+**`prevent_destroy` lifecycle block**
+Setting `prevent_destroy = var.some_bool` doesn't work in Terraform. To toggle it, remove the block from the `.tf` file directly and re-apply.
+
+**Talos kernel parameters cause kernel panic**
+Don't pass `kernel`/`cmdline` parameters via the libvirt Terraform provider — results in kernel panic on boot.
