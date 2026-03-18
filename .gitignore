@@ -14,6 +14,9 @@ terraform.tfstate
 .envrc
 *.envrc
 
+# Cluster topology (contains IPs — use nodes.yaml.example as template)
+nodes.yaml
+
 # Talos generated files
 *talosconfig*
 cluster/controlplane.yaml
