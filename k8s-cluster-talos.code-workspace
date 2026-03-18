@@ -1,0 +1,43 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../argocd.k8sdev.cloud"
+		},
+		{
+			"path": "../fluxcd.k8sdev.cloud"
+		}
+	],
+	"settings": {
+		"vs-kubernetes": {
+			"vs-kubernetes.crd-code-completion": "enabled"
+		},
+		"yaml.schemas": {
+			"file://k8s-cluster-talos/.vscode/schemas/helmrelease-strict.json": [
+				"**/infra/controller/*.yml",
+				"**/apps/*.yml"
+			],
+			"file://k8s-cluster-talos/.vscode/schemas/kustomization-strict.json": [
+				"**/clusters/*/flux-system/kustomization.yaml",
+				"**/infra/*/kustomization.y*ml"
+			],
+			"file://k8s-cluster-talos/.vscode/schemas/gitrepository-strict.json": [
+				"**/clusters/*/flux-system/*.yaml"
+			]
+		},
+		"yaml.customTags": [
+			"!encrypted/pkcs1-oaep scalar",
+			"!vault scalar"
+		],
+		"yaml.validate": true,
+		"yaml.completion": true,
+		"yaml.hover": true,
+		"yaml.schemaStore.enable": true,
+		"yaml.format.enable": true,
+		"[yaml]": {
+			"editor.defaultFormatter": "redhat.vscode-yaml"
+		}
+	}
+}
