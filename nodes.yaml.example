@@ -1,0 +1,66 @@
+nodes:
+  - name: "haproxy"
+    ip: "192.168.178.20"
+    gateway: "192.168.178.1"
+    nameservers:
+      - "192.168.178.253"
+      - "192.168.178.1"
+    vcpus: 1
+    memory_mib: 768
+    disk_size_gib: 20
+    role: "haproxy"
+
+  - name: "control-node-1"
+    ip: "192.168.178.21"
+    gateway: "192.168.178.1"
+    nameservers:
+      - "192.168.178.253"
+      - "192.168.178.1"
+    vcpus: 4
+    memory_mib: 6144
+    disk_size_gib: 10
+    role: "control-node"
+
+  - name: "control-node-2"
+    ip: "192.168.178.22"
+    gateway: "192.168.178.1"
+    nameservers:
+      - "192.168.178.253"
+      - "192.168.178.1"
+    vcpus: 4
+    memory_mib: 6144
+    disk_size_gib: 10
+    role: "control-node"
+
+  - name: "control-node-3"
+    ip: "192.168.178.23"
+    gateway: "192.168.178.1"
+    nameservers:
+      - "192.168.178.253"
+      - "192.168.178.1"
+    vcpus: 4
+    memory_mib: 6144
+    disk_size_gib: 10
+    role: "control-node"
+
+  - name: "worker-node-1"
+    ip: "192.168.178.31"
+    gateway: "192.168.178.1"
+    nameservers:
+      - "192.168.178.253"
+      - "192.168.178.1"
+    vcpus: 4
+    memory_mib: 6144
+    disk_size_gib: 255
+    role: "worker-node"
+
+  - name: "worker-node-2"
+    ip: "192.168.178.32"
+    gateway: "192.168.178.1"
+    nameservers:
+      - "192.168.178.253"
+      - "192.168.178.1"
+    vcpus: 4
+    memory_mib: 6144
+    disk_size_gib: 255
+    role: "worker-node"
