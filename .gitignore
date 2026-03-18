@@ -30,3 +30,4 @@ argocd/create-repo-secret.sh
 # OpenBao credentials output
 openbao-credentials.txt
 openbao-cretentials.txt
+k8s-cluster-talos.code-workspace
