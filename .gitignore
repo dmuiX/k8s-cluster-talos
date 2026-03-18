@@ -16,6 +16,11 @@ terraform.tfstate
 
 # Cluster topology (contains IPs — use nodes.yaml.example as template)
 nodes.yaml
+controlplane.yaml
+secrets.yaml
+worker.yaml
+
+*cluster/*
 
 # Talos generated files
 *talosconfig*
