@@ -1,8 +1,6 @@
 #!/bin/bash
 
-# ==============================================================================
-# Talos Kubernetes Cluster Bootstrap Script
-# ==============================================================================
+# --- Talos Kubernetes Cluster Bootstrap Script ---
 # This script automates the complete setup of a Talos Linux Kubernetes cluster
 # on KVM/libvirt with HAProxy load balancer and Cloudflare DNS.
 #
@@ -43,13 +41,15 @@
 #     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
 #     --cleanup-all           Complete cleanup: VMs + DNS (terraform destroy)
 #
-# ==============================================================================
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
-# ==============================================================================
-# Help Function
-# ==============================================================================
+# --- Versions ---
+CILIUM_VERSION="1.18.2"
+ARGOCD_VERSION="v3.0.19"
+GATEWAY_API_VERSION="v1.3.0"
+
+# --- Help Function ---
 show_help() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS]
@@ -99,12 +99,9 @@ EOF
     exit 0
 }
 
-# ==============================================================================
-# Error Handling and Cleanup
-# ==============================================================================
+# --- Error Handling and Cleanup ---
 # This function runs when the script exits with an error
 # It performs terraform destroy to clean up partially created infrastructure
-# ==============================================================================
 
 CLEANUP_ON_ERROR=true  # Can be set to false with --no-cleanup flag
 
@@ -128,12 +125,9 @@ cleanup_on_error() {
         
         echo -e "==> Cleaning up infrastructure..."
         
-        # Navigate to vms directory and run terraform destroy
         if [ -n "${VMS_DIR:-}" ] && [ -d "$VMS_DIR" ]; then
             echo "Running terraform destroy to clean up VMs..."
-            cd "$VMS_DIR"
             cleanup_vms_only
-            # terraform destroy -auto-approve
             echo "✓ VMs destroyed"
         else
             echo "Warning: Could not locate VMS_DIR for cleanup."
@@ -155,9 +149,7 @@ cleanup_on_error() {
 # Set trap to run cleanup on script exit (only if error occurs)
 trap cleanup_on_error EXIT
 
-# ==============================================================================
-# Initial Setup and Configuration
-# ==============================================================================
+# --- Initial Setup and Configuration ---
 
 # Store current working directory (project root)
 pwd=$(pwd)
@@ -171,9 +163,7 @@ else
     SUDO=""
 fi
 
-# ==============================================================================
-# Cleanup Functions
-# ==============================================================================
+# --- Cleanup Functions ---
 
 # ------------------------------------------------------------------------------
 # cleanup_vms_only: Remove only VMs (keeps Cloudflare DNS records)
@@ -208,9 +198,438 @@ cleanup_vms_only() {
     echo "--- Cleanup finished ---"
 }
 
-# ==============================================================================
-# Load Environment Variables
-# ==============================================================================
+# --- Helper Functions ---
+
+# --- Helper Function: Ensure Custom Talos ISO ---
+# Creates a custom Talos ISO with system extensions:
+#   - qemu-guest-agent: Better VM integration
+#   - amd-ucode: AMD microcode updates
+#   - util-linux-tools: Additional utilities
+#
+# Uses Talos Image Factory API to generate custom ISO with schematic ID
+
+# --- Generic download function with retry and checksum verification ---
+
+download_and_verify() {
+    local name="$1"
+    local url="$2"
+    local dest="$3"
+    local checksum_url="$4"
+    local pattern="$5"
+    local use_sudo="${6:-false}"
+    local fatal="${7:-true}"
+
+    local cmd_prefix=""
+    if [ "$use_sudo" = "true" ]; then
+        cmd_prefix="$SUDO"
+    fi
+
+    echo "==> Checking ${name}..."
+
+    if $cmd_prefix test -f "$dest"; then
+        echo "${name} already exists."
+        return 0
+    fi
+    
+    # Download with 3 retries
+    echo "Downloading ${name}..."
+    for i in {1..3}; do
+        if $cmd_prefix curl -L --progress-bar -o "$dest" "$url"; then
+            echo "✓ Downloaded successfully."
+            $cmd_prefix chmod 644 "$dest"
+            break
+        fi
+        
+        if [ $i -lt 3 ]; then
+            echo "Retry $i/3..."
+            $cmd_prefix rm -f "$dest"
+            sleep 5
+        else
+            echo "✗ Download failed after 3 attempts"
+            if [ "$fatal" = "true" ]; then
+                exit 1
+            else
+                return 1
+            fi
+        fi
+    done
+    
+    # Verify checksum if provided
+    if [ -z "$checksum_url" ]; then
+        return 0
+    fi
+    
+    echo "Verifying integrity..."
+    local tmp="/tmp/checksum-$$.txt"
+    
+    if ! curl -sL "$checksum_url" > "$tmp"; then
+        echo "WARNING: Checksum download failed."
+        return 0
+    fi
+    
+    if [ -n "$pattern" ]; then
+        # Extract checksum for specific file pattern
+        local expected=$(grep "$pattern" "$tmp" | awk '{print $1}')
+        local actual=$($cmd_prefix sha256sum "$dest" | awk '{print $1}')
+        
+        if [ "$expected" = "$actual" ]; then
+            echo "✓ Verified."
+        else
+            echo "✗ Checksum mismatch!"
+            $cmd_prefix rm -f "$dest"
+            rm -f "$tmp"
+            if [ "$fatal" = "true" ]; then
+                exit 1
+            else
+                return 1
+            fi
+        fi
+    else
+        # Use sha256sum -c for standard checksum files
+        if $cmd_prefix sha256sum -c --ignore-missing < "$tmp" 2>/dev/null | grep -q "$(basename "$dest").*OK"; then
+            echo "✓ Verified."
+        else
+            echo "✗ Verification failed!"
+            $cmd_prefix rm -f "$dest"
+            rm -f "$tmp"
+            if [ "$fatal" = "true" ]; then
+                exit 1
+            else
+                return 1
+            fi
+        fi
+    fi
+    
+    rm -f "$tmp"
+}
+
+
+# --- Helper Function: Generate Node-Specific Configuration Patches ---
+# Creates network configuration patches for each node based on nodes.yaml
+#
+# This function:
+#   1. Reads node definitions from nodes.yaml (by role)
+#   2. Gets MAC addresses from Terraform output
+#   3. Creates patch files with static network config
+#   4. Applies patches to base configs to create node-specific configs
+#
+# Parameters:
+#   $1 role - Node role to process ("control-node" or "worker-node")
+#
+# Generated files:
+#   - ./node-configs/{name}-network-patch.yaml (temporary patch file)
+#   - ./{name}-patched.yaml (final node-specific config)
+
+generate_patch_files_by_role() {
+    local role=$1
+    
+    # necessary to write it like that because EOF isnt working any other way!
+    # Create schematic YAML defining required extensions
+    local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
+        -H "Content-Type: application/yaml" \
+        --data-binary @- <<'EOF' | jq -r '.id'
+customization:
+    systemExtensions:
+        officialExtensions:
+        - siderolabs/qemu-guest-agent
+        - siderolabs/amd-ucode
+        - siderolabs/util-linux-tools
+        - siderolabs/iscsi-tools
+EOF
+)
+    if [ -z "$schematic_id" ] || [ "$schematic_id" == "null" ]; then
+        echo "Error: Could not create Talos schematic for custom ISO." >&2
+        exit 1
+    fi
+
+    echo -e "\nCreating configurations for ${role}s:"
+    
+    # Read nodes from YAML, convert to JSON for easier parsing
+    while read -r node_json; do
+        local name ip gateway mac
+        
+        # Extract node properties from JSON
+        name=$(echo "$node_json" | jq -r '.name')
+        ip=$(echo "$node_json" | jq -r '.ip')
+        gateway=$(echo "$node_json" | jq -r '.gateway')
+        # Get MAC address from Terraform output (needed for hardware selector)
+        mac=$(cd "$VMS_DIR" && terraform output -json | jq -r --arg NAME "$name" \
+            '.node_macs.value | to_entries[] | select(.key==$NAME) | .value | ascii_downcase')
+        
+        local patch_file="./node-configs/${name}-network-patch.yaml"
+        echo "  ✓ ${name} network patch → ${patch_file}"
+
+        local template_file base_config
+        if [ "$role" == "control-node" ]; then
+            template_file="$pwd/templates/control-node-patch.yaml"
+            base_config="controlplane.yaml"
+        else
+            template_file="$pwd/templates/worker-node-patch.yaml"
+            base_config="worker.yaml"
+        fi
+
+        # Export variables for yq to use in YAML generation
+        # envsubst will replace string placeholders like ${NODE_NAME}.
+        export SCHEMATIC_ID="$schematic_id"
+        export NODE_NAME="$name"
+        export IP="$ip"
+        export GATEWAY="$gateway"
+        export MAC="$mac"
+
+        # Export the nameservers as a JSON array string.
+        # The outer quotes are crucial to assign the whole array as one variable.
+        export NAMESERVERS_ARRAY="$(echo "$node_json" | jq '.nameservers')"
+
+        # This command performs two actions:
+        # 1. `(.. | select(tag == "!!str")) |= envsubst`: Replaces all string
+        #    placeholders like `${IP}` and `${MAC}`. This will also incorrectly
+        #    turn `nameservers: ${NAMESERVERS_ARRAY}` into a string.
+        # 2. `... | .machine.network.nameservers = ...`: This second part FIXES the nameservers
+        #    field by overwriting it with a properly parsed and formatted block-style array.
+        yq '(.. | select(tag == "!!str")) |= envsubst | 
+            .machine.network.nameservers = (env(NAMESERVERS_ARRAY) | .. style="")' \
+          "$template_file" > "$patch_file"
+                        
+        # Apply patch
+        talosctl machineconfig patch "$base_config" --patch @"$patch_file" --output "$name-patched.yaml"
+    done < <(yq e ".nodes[] | select(.role == \"${role}\")" "$NODES_FILE_PATH" -o=json -I=0 | jq -c '.')
+}
+
+# Define retry function for config application
+apply_config_with_retry() {
+  local node_name=$1
+  local node_ip=$2
+  local config_file=$3
+  local max_attempts=3
+  local attempt=1
+  
+  while [ $attempt -le $max_attempts ]; do
+    # Apply config WITH --mode=reboot so Talos handles the reboot properly
+    if talosctl -n "$node_ip" apply-config --insecure --file "$config_file" --mode=reboot 2>&1 | grep -q "applied"; then
+      return 0
+    fi
+    
+    attempt=$((attempt + 1))
+    if [ $attempt -le $max_attempts ]; then
+      sleep 5
+    fi
+  done
+  
+  return 1
+}
+
+# poll_until MSG TIMEOUT INTERVAL CMD...
+# Runs CMD every INTERVAL seconds until it succeeds or TIMEOUT expires.
+# Prints dots, returns 0 on success or 1 on timeout.
+poll_until() {
+    local msg="$1"; shift
+    local timeout="$1"; shift
+    local interval="$1"; shift
+    local elapsed=0
+
+    echo -n "$msg"
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if "$@" &>/dev/null; then
+            echo " ✓ (${elapsed}s)"
+            return 0
+        fi
+        echo -n "."
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    echo ""
+    return 1
+}
+
+# --- Helper Functions for Logging ---
+info() { echo -e "==> $*"; }
+success() { echo -e "✓ $*"; }
+error() { echo -e "❌ Error: $*" >&2; exit 1; }
+
+# --- Spinner and Wait Function ---
+wait_with_spinner() {
+    local msg="$1"; shift; local cmd=("$@")
+    
+    # Run command in background
+    "${cmd[@]}" &> /dev/null &
+    local cmd_pid=$!
+
+    # Simple spinner animation
+    tput civis
+    local spin_chars='/-\|'
+    local i=0
+    echo -n "$msg "
+    
+    while kill -0 $cmd_pid 2>/dev/null; do
+        printf "%s" "${spin_chars:i++%${#spin_chars}:1}"
+        sleep 0.2
+        printf "\b"
+    done
+    
+    tput cnorm
+    wait $cmd_pid
+    local exit_code=$?
+    
+    if [ "$exit_code" -eq 0 ]; then
+        echo "✓"
+    else
+        echo "❌"
+        error "Previous step failed."
+    fi
+}
+
+# --- Main Logic Functions ---
+
+ensure_cli_tools_installed() {
+  info "Checking for required tools (kubectl, yq, openssl)..."
+  for cmd in kubectl yq openssl; do
+      if ! command -v "$cmd" &> /dev/null; then
+          error "'$cmd' is not installed or not in your PATH."
+      fi
+  done
+  success "All required tools are present."
+}
+ensure_flux_dependencies_ready() {
+    # wait for 20 seconds to allow initial reconciliation
+    sleep 20
+    info "Ensuring OpenBao's Flux dependencies are ready..."
+    local dependencies=("cilium" "cert-manager" "longhorn")
+    
+    for dep in "${dependencies[@]}"; do
+        echo "==> Waiting for $dep HelmRelease..."
+        kubectl wait --for=condition=Ready "helmrelease/$dep" \
+            -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
+
+        sleep 5
+
+        # NEW: Wait for actual pods
+        echo "==> Waiting for $dep pods..."
+        case "$dep" in
+            cilium)
+                kubectl wait --for=condition=Ready pod -l k8s-app=cilium \
+                    -n cilium --timeout=5m
+                ;;
+            cert-manager)
+                kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=cert-manager \
+                    -n cert-manager --timeout=5m
+                ;;
+            longhorn)
+                kubectl wait --for=condition=Ready pod -l app=longhorn-manager \
+                    -n longhorn --timeout=5m
+                ;;
+        esac
+        
+        echo "✓ $dep ready"
+    done
+}
+
+get_config_from_helmrelease() {
+  info "Looking for HelmRelease '${HELMRELEASE_NAME}' in namespace '${HELMRELEASE_NAMESPACE}'..."
+  
+  local retries=10
+  local wait=5
+  for ((i=1; i<=retries; i++)); do
+      if kubectl get helmrelease "${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" &> /dev/null; then
+          success "HelmRelease found."
+          break
+      fi
+      if [[ $i -eq $retries ]]; then
+          error "HelmRelease '${HELMRELEASE_NAME}' not found after ${retries} attempts."
+      fi
+      echo "    (Attempt $i/${retries}) Not found yet. Retrying in ${wait} seconds..."
+      sleep $wait
+  done
+
+  wait_with_spinner "Waiting for Flux to process the HelmRelease spec..." \
+      kubectl wait --for=jsonpath='{.status.observedGeneration}' \
+      "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=2m
+
+  info "Reading configuration from HelmRelease spec..."
+  local hr_yaml
+  hr_yaml=$(kubectl get helmrelease "${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" -o yaml)
+
+  export NAMESPACE=$(echo "$hr_yaml" | yq e '.spec.targetNamespace' -)
+  export SECRET_NAME=$(echo "$hr_yaml" | yq e '.spec.values.server.volumes[0].secret.secretName' -)
+  export SECRET_KEY_NAME=$(echo "$hr_yaml" | yq e '.spec.values.server.volumes[0].secret.items[0].key' -)
+
+  if [[ -z "$NAMESPACE" || -z "$SECRET_NAME" || -z "$SECRET_KEY_NAME" ]]; then
+      error "Failed to read config. Check .spec.targetNamespace and .spec.values.server.volumes."
+  fi
+}
+create_unseal_secret() {
+  info "Generating static key and creating secret '${SECRET_NAME}' in '${NAMESPACE}'..."
+  openssl rand 32 | kubectl create secret generic "${SECRET_NAME}" \
+      --namespace="${NAMESPACE}" \
+      --from-file="${SECRET_KEY_NAME}=/dev/stdin" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  success "Secret created. Flux will now reconcile the release."
+}
+initialize_bao() {
+  wait_with_spinner "Waiting for HelmRelease to become ready after secret creation..." \
+      kubectl wait --for=condition=ready "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
+
+  local pod_selector="app.kubernetes.io/name=openbao"
+  wait_with_spinner "Waiting for an OpenBao pod to become ready..." \
+      kubectl -n "${NAMESPACE}" wait --for=jsonpath='{.status.phase}'=Running pod -l "${pod_selector}" --timeout=5m
+
+  local pod_name
+  pod_name=$(kubectl get pods -n "${NAMESPACE}" -l "${pod_selector}" -o jsonpath='{.items[0].metadata.name}')
+  success "Found pod '${pod_name}' to perform initialization."
+
+  local init_status
+  init_status=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+  curl -s http://127.0.0.1:8200/v1/sys/init | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
+
+  info "Checking OpenBao initialization status on pod '${pod_name}'..."
+  if [[ "$init_status" == "true" ]]; then
+      success "OpenBao is already initialized. No action needed."
+  else
+      info "OpenBao is not initialized. Running 'bao operator init' with recovery keys..."
+      local init_output
+      init_output=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" \
+      -- bao operator init \
+      -recovery-shares=5 \
+      -recovery-threshold=3 2>&1)
+      echo -e "\n--- [ OpenBao Initialization Output ] ---\n${init_output}\n-----------------------------------------"
+      echo "${init_output}" > "${OUTPUT_FILE}"
+      success "Initialization complete. Credentials saved to '${OUTPUT_FILE}'."
+      info "IMPORTANT: The file '${OUTPUT_FILE}' contains your root token and recovery keys. Secure it immediately."
+  fi
+}
+
+credentials_prompt() {
+    local need=false
+    for var in CLUSTER_NAME VMS_DIR CLUSTER_DIR NODES_FILE_PATH \
+               TALOS_ISO_URL UBUNTU_IMAGE_URL TF_VAR_cloudflare_api_token; do
+        [ -z "${!var:-}" ] && need=true && break
+    done
+    [ "$need" = false ] && return 0
+
+    echo ""
+    echo "==> Missing required configuration — please enter values below."
+    echo "    (Tip: save these in a .env file to skip this prompt next time)"
+    echo ""
+
+    _ask() {
+        local var="$1" prompt="$2" default="$3"
+        [ -n "${!var:-}" ] && return
+        read -rp "  $prompt${default:+ [$default]}: " val
+        printf -v "$var" '%s' "${val:-$default}"
+    }
+
+    _ask CLUSTER_NAME             "Cluster name"              "talos-cluster"
+    _ask VMS_DIR                  "Terraform/VMs directory"   "$(pwd)/vms"
+    _ask CLUSTER_DIR              "Talos config directory"    "$(pwd)/cluster"
+    _ask NODES_FILE_PATH          "Path to nodes.yaml"        "$(pwd)/nodes.yaml"
+    _ask TALOS_ISO_URL            "Talos ISO URL"             ""
+    _ask UBUNTU_IMAGE_URL         "Ubuntu cloud image URL"    ""
+    _ask TF_VAR_cloudflare_api_token "Cloudflare API token"  ""
+    echo ""
+}
+
+# --- Initialization ---
+
+# --- Load Environment Variables ---
 # Load configuration from .env file if it exists
 # Expected variables:
 #   - CLUSTER_NAME: Name of the Kubernetes cluster
@@ -219,17 +638,15 @@ cleanup_vms_only() {
 #   - NODES_FILE_PATH: Path to nodes.yaml
 #   - TALOS_ISO_URL, UBUNTU_IMAGE_URL: Download URLs
 #   - TF_VAR_*: Terraform variables (Cloudflare, libvirt, etc.)
-# ==============================================================================
 
 if [ -f .env ]; then
     set -a  # Automatically export all variables
     source .env
     set +a  # Disable auto-export
 fi
+credentials_prompt
 
-# ==============================================================================
-# Parse Command-Line Arguments
-# ==============================================================================
+# --- Parse Command-Line Arguments ---
 
 SKIP_TERRAFORM=false
 SKIP_ISO_DOWNLOAD=false
@@ -322,129 +739,25 @@ if [[ "$DEBUG" == "true" ]]; then
     set -x
 fi
 
-# ==============================================================================
-# Helper Function: Ensure Custom Talos ISO
-# ==============================================================================
-# Creates a custom Talos ISO with system extensions:
-#   - qemu-guest-agent: Better VM integration
-#   - amd-ucode: AMD microcode updates
-#   - util-linux-tools: Additional utilities
-#
-# Uses Talos Image Factory API to generate custom ISO with schematic ID
-# ==============================================================================
+# --- Cluster Topology (read once from nodes.yaml) ---
+HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
+set +o pipefail
+FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+set -o pipefail
+CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
+CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
+WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
+K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
 
-# ==============================================================================
-# Generic download function with retry and checksum verification
-# ==============================================================================
+# --- Phases ---
 
-download_and_verify() {
-    local name="$1"
-    local url="$2"
-    local dest="$3"
-    local checksum_url="$4"
-    local pattern="$5"
-    local use_sudo="${6:-false}"
-    local fatal="${7:-true}"
 
-    echo "==> Checking ${name}..."
-    
-    if [ -f "$dest" ]; then
-        echo "${name} already exists."
-        return 0
-    fi
-
-    local cmd_prefix=""
-    if [ "$use_sudo" = "true" ]; then
-        cmd_prefix="$SUDO"
-    fi
-    
-    echo "==> Checking ${name}..."
-    
-    if $cmd_prefix test -f "$dest"; then
-        echo "${name} already exists."
-        return 0
-    fi
-    
-    # Download with 3 retries
-    echo "Downloading ${name}..."
-    for i in {1..3}; do
-        if $cmd_prefix curl -L --progress-bar -o "$dest" "$url"; then
-            echo "✓ Downloaded successfully."
-            $cmd_prefix chmod 644 "$dest"
-            break
-        fi
-        
-        if [ $i -lt 3 ]; then
-            echo "Retry $i/3..."
-            $cmd_prefix rm -f "$dest"
-            sleep 5
-        else
-            echo "✗ Download failed after 3 attempts"
-            if [ "$fatal" = "true" ]; then
-                exit 1
-            else
-                return 1
-            fi
-        fi
-    done
-    
-    # Verify checksum if provided
-    if [ -z "$checksum_url" ]; then
-        return 0
-    fi
-    
-    echo "Verifying integrity..."
-    local tmp="/tmp/checksum-$$.txt"
-    
-    if ! curl -sL "$checksum_url" > "$tmp"; then
-        echo "WARNING: Checksum download failed."
-        return 0
-    fi
-    
-    if [ -n "$pattern" ]; then
-        # Extract checksum for specific file pattern
-        local expected=$(grep "$pattern" "$tmp" | awk '{print $1}')
-        local actual=$($cmd_prefix sha256sum "$dest" | awk '{print $1}')
-        
-        if [ "$expected" = "$actual" ]; then
-            echo "✓ Verified."
-        else
-            echo "✗ Checksum mismatch!"
-            $cmd_prefix rm -f "$dest"
-            rm -f "$tmp"
-            if [ "$fatal" = "true" ]; then
-                exit 1
-            else
-                return 1
-            fi
-        fi
-    else
-        # Use sha256sum -c for standard checksum files
-        if $cmd_prefix sha256sum -c --ignore-missing < "$tmp" 2>/dev/null | grep -q "$(basename "$dest").*OK"; then
-            echo "✓ Verified."
-        else
-            echo "✗ Verification failed!"
-            $cmd_prefix rm -f "$dest"
-            rm -f "$tmp"
-            if [ "$fatal" = "true" ]; then
-                exit 1
-            else
-                return 1
-            fi
-        fi
-    fi
-    
-    rm -f "$tmp"
-}
-
-# ==============================================================================
-# Step 0: Download Required Images (Talos ISO and Ubuntu Cloud Image)
-# ==============================================================================
+phase_download_images() {
+# --- Step 0: Download Required Images (Talos ISO and Ubuntu Cloud Image) ---
 # Downloads and verifies:
 #   - Talos metal ISO for Kubernetes nodes
 #   - Ubuntu cloud image for HAProxy load balancer
 # Both downloads include SHA256 checksum verification
-# ==============================================================================
 
 if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
     cd "${VMS_DIR}"
@@ -472,16 +785,16 @@ if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
 else
     echo "Skipping iso-download as requested."
 fi
+}
 
-# ==============================================================================
-# Step 1: Create VMs with Terraform
-# ==============================================================================
+
+phase_create_vms() {
+# --- Step 1: Create VMs with Terraform ---
 # Uses Terraform to:
 #   - Create libvirt VMs for control plane and worker nodes
 #   - Create HAProxy load balancer VM
 #   - Configure Cloudflare DNS records
 #   - Attach Talos ISO to nodes for initial boot
-# ==============================================================================
 
 if [ "$SKIP_TERRAFORM" = false ]; then
     # Temporarily disable pipefail to avoid SIGPIPE from head
@@ -522,15 +835,15 @@ if [ "$SKIP_TERRAFORM" = false ]; then
     
     echo "Terraform applied successfully."
 fi
+}
 
-# ==============================================================================
-# Step 2: Setup and Pre-flight Checks
-# ==============================================================================
+
+phase_preflight() {
+# --- Step 2: Setup and Pre-flight Checks ---
 # Prepare for cluster bootstrapping:
 #   - Install required tools (talosctl, yq, jq, arp-scan)
 #   - Create cluster directory
 #   - Extract configuration from Terraform output
-# ==============================================================================
 
 # talosctl configuration
 
@@ -547,104 +860,7 @@ if ! command -v talosctl &> /dev/null; then
     echo "Installing talosctl..."
     curl -sL https://talos.dev/install | sh
 fi
-
-# ==============================================================================
-# Helper Function: Generate Node-Specific Configuration Patches
-# ==============================================================================
-# Creates network configuration patches for each node based on nodes.yaml
-#
-# This function:
-#   1. Reads node definitions from nodes.yaml (by role)
-#   2. Gets MAC addresses from Terraform output
-#   3. Creates patch files with static network config
-#   4. Applies patches to base configs to create node-specific configs
-#
-# Parameters:
-#   $1 role - Node role to process ("control-node" or "worker-node")
-#
-# Generated files:
-#   - ./node-configs/{name}-network-patch.yaml (temporary patch file)
-#   - ./{name}-patched.yaml (final node-specific config)
-# ==============================================================================
-
-generate_patch_files_by_role() {
-    local role=$1
-    
-    # necessary to write it like that because EOF isnt working any other way!
-    # Create schematic YAML defining required extensions
-    local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
-        -H "Content-Type: application/yaml" \
-        --data-binary @- <<'EOF' | jq -r '.id'
-customization:
-    systemExtensions:
-        officialExtensions:
-        - siderolabs/qemu-guest-agent
-        - siderolabs/amd-ucode
-        - siderolabs/util-linux-tools
-        - siderolabs/iscsi-tools
-EOF
-)
-    if [ -z "$schematic_id" ] || [ "$schematic_id" == "null" ]; then
-        echo "Error: Could not create Talos schematic for custom ISO." >&2
-        exit 1
-    fi
-
-    echo -e "\nCreating configurations for ${role}s:"
-    
-    # Read nodes from YAML, convert to JSON for easier parsing
-    while read -r node_json; do
-        local name ip gateway mac
-        
-        # Extract node properties from JSON
-        name=$(echo "$node_json" | jq -r '.name')
-        ip=$(echo "$node_json" | jq -r '.ip')
-        gateway=$(echo "$node_json" | jq -r '.gateway')
-        # Get MAC address from Terraform output (needed for hardware selector)
-        mac=$(cd "$VMS_DIR" && terraform output -json | jq -r --arg NAME "$name" \
-            '.node_macs.value | to_entries[] | select(.key==$NAME) | .value | ascii_downcase')
-        
-        local patch_file="./node-configs/${name}-network-patch.yaml"
-        echo "  ✓ ${name} network patch → ${patch_file}"
-
-        local template_file base_config
-        if [ "$role" == "control-node" ]; then
-            template_file="$pwd/templates/control-node-patch.yaml"
-            base_config="controlplane.yaml"
-        else
-            template_file="$pwd/templates/worker-node-patch.yaml"
-            base_config="worker.yaml"
-        fi
-
-        # Export variables for yq to use in YAML generation
-        # envsubst will replace string placeholders like ${NODE_NAME}.
-        export SCHEMATIC_ID="$schematic_id"
-        export NODE_NAME="$name"
-        export IP="$ip"
-        export GATEWAY="$gateway"
-        export MAC="$mac"
-
-        # Export the nameservers as a JSON array string.
-        # The outer quotes are crucial to assign the whole array as one variable.
-        export NAMESERVERS_ARRAY="$(echo "$node_json" | jq '.nameservers')"
-
-        # This command performs two actions:
-        # 1. `(.. | select(tag == "!!str")) |= envsubst`: Replaces all string
-        #    placeholders like `${IP}` and `${MAC}`. This will also incorrectly
-        #    turn `nameservers: ${NAMESERVERS_ARRAY}` into a string.
-        # 2. `... | .machine.network.nameservers = ...`: This second part FIXES the nameservers
-        #    field by overwriting it with a properly parsed and formatted block-style array.
-        yq '(.. | select(tag == "!!str")) |= envsubst | 
-            .machine.network.nameservers = (env(NAMESERVERS_ARRAY) | .. style="")' \
-          "$template_file" > "$patch_file"
-                        
-        # Apply patch
-        talosctl machineconfig patch "$base_config" --patch @"$patch_file" --output "$name-patched.yaml"
-    done < <(yq e ".nodes[] | select(.role == \"${role}\")" "$NODES_FILE_PATH" -o=json -I=0 | jq -c '.')
-}
-
-# ==============================================================================
-# Main Script Execution
-# ==============================================================================
+# --- Main Script Execution ---
 
 echo "==> Step 2a: Performing pre-flight checks..."
 
@@ -656,19 +872,19 @@ echo "==> Step 2a: Performing pre-flight checks..."
 if ! command -v yq &> /dev/null; then echo "yq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y yq; fi
 if ! command -v jq &> /dev/null; then echo "jq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y jq; fi
 if ! command -v curl &> /dev/null; then echo "curl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y curl; fi
-if ! command -v $SUDO arp-scan $> /dev/null; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
+if ! command -v arp-scan &> /dev/null; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
 
 cd "$CLUSTER_DIR"
+}
 
-# ==============================================================================
-# Step 3: Generate Talos Secrets and Machine Configurations
-# ==============================================================================
+
+phase_generate_configs() {
+# --- Step 3: Generate Talos Secrets and Machine Configurations ---
 # Generate:
 #   - Secrets bundle (certificates, tokens, keys)
 #   - Base machine configs for control plane and workers
 #   - Configure Kubernetes API endpoint (HAProxy IP)
 # Only run if NOT skipping config creation
-# ==============================================================================
 
 if [ "$SKIP_CONFIG_CREATION" = false ]; then
     echo "==> Step 2b: Detecting install disk from VM configuration..."
@@ -702,12 +918,10 @@ if [ "$SKIP_CONFIG_CREATION" = false ]; then
     fi
 
     echo -e "\n==> Step 3b: Reading HAProxy IP for Kubernetes endpoint..."
-    HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
     if [ -z "$HAPROXY_IP" ]; then
         echo "Error: Could not find HAProxy IP in $NODES_FILE_PATH" >&2
         exit 1
     fi
-    K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
     echo "Kubernetes endpoint will be: ${K8S_ENDPOINT}"
 
     echo -e "\n==> Step 3c: Generating machine configurations..."
@@ -736,15 +950,10 @@ else
     echo "  - secrets.yaml"
     echo "  - controlplane.yaml and worker.yaml"
     
-    # Still need to read HAProxy IP for later steps
-    HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
-    K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
     INSTALL_DISK="/dev/vda"  # Default, won't be used for generation
 fi
 
-# ==============================================================================
-# Step 4: Wait for VMs to Boot from ISO
-# ==============================================================================
+# --- Step 4: Wait for VMs to Boot from ISO ---
 # At this point:
 #   - VMs have been created by Terraform with ISO attached
 #   - Nodes are booting from the Talos ISO (live environment)
@@ -757,7 +966,6 @@ fi
 #   - Network configuration
 #   - Node-specific patches
 # These configs will be applied to nodes running on DHCP IPs
-# ==============================================================================
 
 echo -e "\n==> Step 4-5: Generating node-specific configurations..."
 cd "$CLUSTER_DIR"
@@ -766,103 +974,43 @@ mkdir -p ./node-configs
 if [ "$SKIP_CONFIG_CREATION" = true ]; then
     echo "Skipping node-specific config generation (--skip-config-creation flag set)."
 else
-    CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-    WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
     echo "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
 
     # Use the new helper function to create patch files.
     generate_patch_files_by_role "control-node"
     generate_patch_files_by_role "worker-node"
 fi
+}
 
-# ==============================================================================
-# Steps 6-9: Bootstrap Process
-# ==============================================================================
+
+phase_bootstrap() {
+# --- Steps 6-9: Bootstrap Process ---
 # Only run if NOT skipping bootstrap
-# ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
 
 echo -e "\n==> Continuing with node installation and bootstrap..."
 
-# ==============================================================================
-# Step 6: Discover Dynamic IPs and Apply Configurations
-# ==============================================================================
+# --- Step 6: Discover Dynamic IPs and Apply Configurations ---
 # Workflow:
 #   1. Discover nodes via arp-scan (they have DHCP IPs now)
 #   2. Match MAC addresses from Terraform to discovered IPs
 #   3. Eject ISO from all nodes
 #   4. Apply machine configs to dynamic IPs with --mode=reboot
 #   5. Nodes reboot and boot from disk with static IPs configured
-# ==============================================================================
 
 echo -e "\n==> Step 6: Verifying HAProxy is ready..."
 
-# Check if HAProxy is accessible before proceeding with control nodes
-HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
 echo "Checking HAProxy at ${HAPROXY_IP}:6443..."
 
-RETRY=0
-MAX_RETRY=36  # 6 minutes max (36 * 10s)
-HAPROXY_READY=false
-
-while [ $RETRY -lt $MAX_RETRY ]; do
-    if nc -z -w 5 "$HAPROXY_IP" 6443 2>/dev/null || timeout 5 bash -c "echo > /dev/tcp/${HAPROXY_IP}/6443" 2>/dev/null; then
-        echo "✓ HAProxy is listening on port 6443"
-        HAPROXY_READY=true
-        break
-    fi
-    
-    if [ $RETRY -eq 0 ]; then
-        echo -n "Waiting for HAProxy to become ready"
-    fi
-    
-    # Show progress every 5 attempts (50 seconds)
-    if [ $((RETRY % 5)) -eq 0 ] && [ $RETRY -gt 0 ]; then
-        echo -n " [${RETRY}0s]"
-    else
-        echo -n "."
-    fi
-    
-    sleep 10
-    RETRY=$((RETRY+1))
-done
-
-if [ "$HAPROXY_READY" = false ]; then
-    echo ""
-    echo "⚠ Warning: HAProxy not responding on port 6443 after 6 minutes"
-    echo "  Continuing anyway - HAProxy will be needed once control plane starts"
-    echo "  You may need to check HAProxy logs: ssh ubuntu@${HAPROXY_IP}"
-else
-    if [ $RETRY -gt 0 ]; then
-        echo ""
-    fi
+if ! poll_until "Waiting for HAProxy on port 6443" 360 10 \
+        bash -c "nc -z -w 5 \"$HAPROXY_IP\" 6443 || echo > /dev/tcp/${HAPROXY_IP}/6443"; then
+    echo "⚠ Warning: HAProxy not responding after 6 minutes — continuing anyway"
+    echo "  Check HAProxy logs: ssh ubuntu@${HAPROXY_IP}"
 fi
 
 echo -e "\n==> Step 7: Applying configurations to nodes..."
 
-# Define retry function for config application
-apply_config_with_retry() {
-  local node_name=$1
-  local node_ip=$2
-  local config_file=$3
-  local max_attempts=3
-  local attempt=1
-  
-  while [ $attempt -le $max_attempts ]; do
-    # Apply config WITH --mode=reboot so Talos handles the reboot properly
-    if talosctl -n "$node_ip" apply-config --insecure --file "$config_file" --mode=reboot 2>&1 | grep -q "applied"; then
-      return 0
-    fi
-    
-    attempt=$((attempt + 1))
-    if [ $attempt -le $max_attempts ]; then
-      sleep 5
-    fi
-  done
-  
-  return 1
-}
 
 cd "$VMS_DIR"
 
@@ -884,15 +1032,6 @@ while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
       <(sudo arp-scan --interface=br0 --localnet | awk '/:/ {print $2, $1}' | sort -k1,1))
 
   if [ -n "$DISCOVERED_IPS" ]; then
-      # Verify at least one node is actually ready (Talos API responding)
-      NODE_READY=false
-      echo "$DISCOVERED_IPS" | while read -r name ip; do
-          if timeout 2 talosctl -n "$ip" version --insecure &>/dev/null; then
-              NODE_READY=true
-              break
-          fi
-      done 2>/dev/null
-      
       # If we have IPs and at least one responds, we're good
       FOUND_COUNT=$(echo "$DISCOVERED_IPS" | wc -l)
       if [ "$FOUND_COUNT" -ge "$EXPECTED_NODE_COUNT" ]; then
@@ -944,13 +1083,10 @@ echo "Using talosconfig: $TALOSCONFIG"
 CONTROL_IPS=$(echo "$DYNAMIC_IPS" | grep '^control-node' || true)
 WORKER_IPS=$(echo "$DYNAMIC_IPS" | grep '^worker-node' || true)
 
-# ==============================================================================
-# Step 7: Install ALL nodes in parallel (control + workers)
-# ==============================================================================
+# --- Step 7: Install ALL nodes in parallel (control + workers) ---
 # Apply configurations to all nodes simultaneously for faster installation
 # Then wait only for first control node to be ready before bootstrapping
 # Workers will join the cluster automatically after bootstrap completes
-# ==============================================================================
 
 echo -e "\n==> Step 7: Installing Talos on all nodes (parallel)..."
 
@@ -976,23 +1112,29 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 NODE_NUMBER=1
 FAILED_NODES=""
 
-echo "$ALL_NODE_IPS" | while read -r name dyn_ip; do
+declare -A job_pids
+while read -r name dyn_ip; do
   echo "[${NODE_NUMBER}/${TOTAL_NODES}] Applying config to ${name} (${dyn_ip})..."
   (
     if ! apply_config_with_retry "$name" "$dyn_ip" "./${name}-patched.yaml"; then
-      echo "$name" >> /tmp/failed_nodes_$$
+      exit 1
     fi
   ) &
+  job_pids[$!]=$name
   NODE_NUMBER=$((NODE_NUMBER + 1))
+done < <(echo "$ALL_NODE_IPS")
+
+# Wait for all background jobs and check exit codes
+failed=()
+for pid in "${!job_pids[@]}"; do
+  if ! wait "$pid"; then
+    failed+=("${job_pids[$pid]}")
+  fi
 done
 
-# Wait for all background jobs to complete
-wait
-
 # Check for failures
-if [ -f /tmp/failed_nodes_$$ ]; then
-  FAILED_NODES=$(cat /tmp/failed_nodes_$$)
-  rm -f /tmp/failed_nodes_$$
+if [ ${#failed[@]} -gt 0 ]; then
+  FAILED_NODES="${failed[*]}"
   echo "⚠ Warning: Some nodes failed to apply config: $FAILED_NODES"
   echo "Continuing with remaining nodes..."
 else
@@ -1008,21 +1150,20 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 cd "$VMS_DIR"
 
 # Process ALL nodes (both control and worker)
-echo "$ALL_NODE_IPS" | while read -r name dyn_ip; do
+while read -r name dyn_ip; do
   if [ -z "$name" ]; then
     continue
   fi
-  
+
   echo "Setting boot order for: $name"
-  
+
   # Use virt-xml to set boot order: disk first, cdrom second
-  # This persists the change in the VM definition
   if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
     echo "  ✓ Boot order updated for $name (disk->cdrom)"
   else
     echo "  ⚠ Warning: Failed to update boot order for $name"
   fi
-done
+done < <(echo "$ALL_NODE_IPS")
 
 cd "$CLUSTER_DIR"
 
@@ -1039,44 +1180,20 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Phase 7.3: Waiting for first control node to be ready"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Get control plane static IPs
-CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-
 echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
 talosctl config endpoint $CONTROL_STATIC_IPS
 
 FIRST_READY=""
-MAX_WAIT=90 # 1m30s
-ELAPSED=0
-
-echo "Checking for first ready control node..."
-while [ -z "$FIRST_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-  for ip in $CONTROL_STATIC_IPS; do
-    # Use authenticated connection
-    if talosctl -n "$ip" version --client=false &>/dev/null; then
-      FIRST_READY="$ip"
-      echo ""
-      echo "✓ First control node ready: $ip (${ELAPSED}s)"
-      break
+for ip in $CONTROL_STATIC_IPS; do
+    if poll_until "Checking control node $ip" 180 2 talosctl -n "$ip" version --client=false; then
+        FIRST_READY="$ip"
+        break
     fi
-  done
-  
-  if [ -z "$FIRST_READY" ]; then
-    if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-      echo -n " [${ELAPSED}s]"
-    else
-      echo -n "."
-    fi
-    sleep 2
-    ELAPSED=$((ELAPSED + 2))
-  fi
 done
 
 if [ -z "$FIRST_READY" ]; then
-  echo ""
-  echo "⚠ Warning: No control nodes ready after ${MAX_WAIT}s"
-  echo "Cannot proceed with bootstrap. Check node status manually."
-  exit 1
+    echo "⚠ No control nodes ready after 180s — check node status manually."
+    exit 1
 fi
 
 echo "✓ Control plane is ready. Workers will join after bootstrap."
@@ -1089,13 +1206,6 @@ else
     # Still need to set up essential variables for later steps
     cd "${CLUSTER_DIR}"
     
-    # Get first control plane IP for kubeconfig retrieval
-    set +o pipefail
-    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
-    set -o pipefail
-    
-    # Configure talosctl endpoints
-    CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
     echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
     talosctl config endpoint $CONTROL_STATIC_IPS
     
@@ -1105,114 +1215,55 @@ fi
 
 # At this point, first control node is ready! Bootstrap immediately.
 
-# ==============================================================================
-# Step 8: Bootstrap Kubernetes Cluster
-# ==============================================================================
+# --- Step 8: Bootstrap Kubernetes Cluster ---
 # Initialize the Kubernetes cluster on the first control plane node
 # This creates the etcd cluster and starts Kubernetes components
-# ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
     echo -e "\n==> Step 8: Bootstrapping Kubernetes cluster..."
 
-    # Temporarily disable pipefail to avoid SIGPIPE from head
-    set +o pipefail
-    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
-    set -o pipefail
-
     echo "Bootstrapping on first ready node: ${FIRST_CP_STATIC_IP}"
 
-    RETRY=0
-    MAX_RETRY=3
-    while [ $RETRY -lt $MAX_RETRY ]; do
-        if talosctl -n "$FIRST_CP_STATIC_IP" bootstrap; then
-            echo "✓ Bootstrap successful."
-            break
-        fi
-        RETRY=$((RETRY+1))
-        if [ $RETRY -lt $MAX_RETRY ]; then
-            echo "! Bootstrap failed, retrying in 15s... (Attempt $RETRY/$MAX_RETRY)"
-            sleep 15
-        fi
-    done
-
-    if [ $RETRY -eq $MAX_RETRY ]; then
-        echo "✗ Bootstrap failed after $MAX_RETRY attempts. Cluster may already be bootstrapped or there's a critical issue."
-        echo "  Try manually: talosctl -n $FIRST_CP_STATIC_IP bootstrap"
-    else
-        # Verify etcd is healthy after bootstrap
+    if poll_until "Bootstrapping cluster" 45 15 talosctl -n "$FIRST_CP_STATIC_IP" bootstrap; then
         echo "Verifying etcd cluster health..."
-        sleep 10  # Give etcd a moment to stabilize
-        if talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null | grep -q "Running"; then
-            echo "✓ Etcd is running and healthy"
-        else
-            echo "⚠ Warning: Could not verify etcd status (may still be starting)"
-        fi
+        sleep 10
+        talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null | grep -q "Running" \
+            && echo "✓ Etcd is running and healthy" \
+            || echo "⚠ Warning: Could not verify etcd status (may still be starting)"
+    else
+        echo "✗ Bootstrap failed — cluster may already be bootstrapped or there is a critical issue."
+        echo "  Try manually: talosctl -n $FIRST_CP_STATIC_IP bootstrap"
     fi
 else
     echo -e "\n==> Step 8: Skipping bootstrap as requested."
     echo "Cluster should already be bootstrapped."
-    
-    # First control plane IP should already be set from the else block above
-    # But set it again if somehow needed
-    if [ -z "$FIRST_CP_STATIC_IP" ]; then
-        set +o pipefail
-        FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
-        set -o pipefail
-    fi
+
+    set +o pipefail
+    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+    set -o pipefail
 fi
 
-# ==============================================================================
-# Step 8a: Wait for Remaining Control Nodes to Join
-# ==============================================================================
+# --- Step 8a: Wait for Remaining Control Nodes to Join ---
 # Now that bootstrap is complete, wait for other control nodes to join etcd
-# ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-  CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
   if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
       echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
       
+      echo "Waiting for all ${CONTROL_NODE_COUNT} control nodes to join etcd..."
       READY_NODES="$FIRST_CP_STATIC_IP"
-      MAX_WAIT=90
-      ELAPSED=0
-      
-      echo "Waiting for ${CONTROL_NODE_COUNT} control nodes to join etcd cluster..."
-      while [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-          for ip in $CONTROL_STATIC_IPS; do
-              # Skip if already marked as ready
-              if echo "$READY_NODES" | grep -q "$ip"; then
-                  continue
-              fi
-              
-              # Check if node is responsive
-              if talosctl -n "$ip" version --client=false &>/dev/null; then
-                  READY_NODES="$READY_NODES $ip"
-                  READY_COUNT=$(echo "$READY_NODES" | wc -w)
-                  echo "✓ Control node joined: $ip [${READY_COUNT}/${CONTROL_NODE_COUNT}]"
-              fi
-          done
-          
-          if [ $(echo "$READY_NODES" | wc -w) -lt $CONTROL_NODE_COUNT ]; then
-              if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-                  echo -n " [${ELAPSED}s]"
-              else
-                  echo -n "."
-              fi
-              sleep 2
-              ELAPSED=$((ELAPSED + 2))
+      for ip in $CONTROL_STATIC_IPS; do
+          echo "$READY_NODES" | grep -q "$ip" && continue
+          if poll_until "  Waiting for control node $ip" 90 2 talosctl -n "$ip" version --client=false; then
+              READY_NODES="$READY_NODES $ip"
+              echo "✓ Control node joined: $ip [$(echo "$READY_NODES" | wc -w)/${CONTROL_NODE_COUNT}]"
           fi
       done
-      
+
       FINAL_COUNT=$(echo "$READY_NODES" | wc -w)
-      if [ $FINAL_COUNT -lt $CONTROL_NODE_COUNT ]; then
-          echo ""
-          echo "⚠ Warning: Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined after ${MAX_WAIT}s"
-          echo "Check missing nodes with: talosctl -n <ip> get members --namespace=os"
-      else
-          echo ""
-          echo "✓ All ${CONTROL_NODE_COUNT} control nodes have joined the cluster!"
-      fi
+      [ "$FINAL_COUNT" -ge "$CONTROL_NODE_COUNT" ] \
+          && echo "✓ All ${CONTROL_NODE_COUNT} control nodes joined!" \
+          || echo "⚠ Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined — check: talosctl -n <ip> get members --namespace=os"
   fi
 
   # ==============================================================================
@@ -1229,39 +1280,16 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
       WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
       
       FIRST_WORKER_READY=""
-      MAX_WAIT=90
-      ELAPSED=0
-      
-      echo "Checking for first ready worker node..."
-      while [ -z "$FIRST_WORKER_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
-          for ip in $WORKER_STATIC_IPS; do
-              # Use authenticated connection
-              if talosctl -n "$ip" version --client=false &>/dev/null; then
-                  FIRST_WORKER_READY="$ip"
-                  echo ""
-                  echo "✓ First worker node ready: $ip (${ELAPSED}s)"
-                  break
-              fi
-          done
-          
-          if [ -z "$FIRST_WORKER_READY" ]; then
-              if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-                  echo -n " [${ELAPSED}s]"
-              else
-                  echo -n "."
-              fi
-              sleep 2
-              ELAPSED=$((ELAPSED + 2))
+      for ip in $WORKER_STATIC_IPS; do
+          if poll_until "Checking worker $ip" 90 2 talosctl -n "$ip" version --client=false; then
+              FIRST_WORKER_READY="$ip"
+              break
           fi
       done
-      
-      if [ -z "$FIRST_WORKER_READY" ]; then
-          echo ""
-          echo "⚠ Warning: No worker nodes ready after ${MAX_WAIT}s"
-          echo "Workers may still be booting or joining. Check manually with: kubectl get nodes"
-      else
-          echo "✓ Worker nodes are ready and will join the cluster"
-      fi
+
+      [ -n "$FIRST_WORKER_READY" ] \
+          && echo "✓ Worker nodes are ready and will join the cluster" \
+          || echo "⚠ No worker nodes ready after 90s — check: kubectl get nodes"
   else
       echo -e "\n⚠ No worker nodes found to verify"
   fi
@@ -1269,12 +1297,9 @@ else
   echo -e "\n==> Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
 fi
 
-# ==============================================================================
-# Step 9: Retrieve Kubeconfig and Finale!
-# ==============================================================================
+# --- Step 9: Retrieve Kubeconfig and Finale! ---
 # Wait for Kubernetes API server to be ready
 # Retrieve and save kubeconfig for kubectl access
-# ==============================================================================
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo -e "\n==> Step 9: Retrieving kubeconfig..."
@@ -1282,74 +1307,29 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
 
   echo "Waiting for Kubernetes API to be ready..."
 
-  RETRY=0
-  MAX_RETRY=20
-  while [ $RETRY -lt $MAX_RETRY ]; do
-      if talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force 2>/dev/null; then
-          echo "✓ Kubeconfig retrieved successfully."
-          break
-      fi
-      RETRY=$((RETRY+1))
-      if [ $RETRY -lt $MAX_RETRY ]; then
-          echo -n "."
-          sleep 10
-      fi
-  done
-
-  if [ $RETRY -eq $MAX_RETRY ]; then
-      echo "\n✗ Failed to retrieve kubeconfig after $((MAX_RETRY * 10))s."
-      echo "  The cluster may still be initializing. Try later: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
+  if ! poll_until "Waiting for kubeconfig" 200 10 \
+          talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force; then
+      echo "✗ Failed to retrieve kubeconfig after 200s — try manually: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
   fi
 else
   echo -e "\n==> Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
 fi
+}
 
-# ==============================================================================
-# Step 10: Install Cilium CNI with KubePrism
-# ==============================================================================
+
+phase_install_cilium() {
+# --- Step 10: Install Cilium CNI with KubePrism ---
 # Install Cilium using Talos's built-in KubePrism load balancer
 # This avoids certificate issues and provides optimal performance
-# ==============================================================================
 
 if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
   echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
 
   # Wait for Kubernetes API to be fully ready
   echo "Waiting for Kubernetes API to be fully ready..."
-  RETRY=0
-  MAX_RETRY=60  # 10 minutes max
-  API_READY=false
-  
-  while [ $RETRY -lt $MAX_RETRY ]; do
-      # Try to list nodes - this confirms API server is responding
-      if kubectl get nodes &>/dev/null; then
-          API_READY=true
-          echo ""
-          echo "✓ Kubernetes API is ready (${RETRY}0s)"
-          break
-      fi
-      
-      if [ $RETRY -eq 0 ]; then
-          echo -n "Waiting for API server to be ready"
-      fi
-      
-      # Show progress every 3 attempts (30 seconds)
-      if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
-          echo -n " [${RETRY}0s]"
-      else
-          echo -n "."
-      fi
-      
-      sleep 10
-      RETRY=$((RETRY+1))
-  done
-  
-  if [ "$API_READY" = false ]; then
-      echo ""
-      echo "⚠ Warning: Kubernetes API still not ready after $((MAX_RETRY * 10))s"
-      echo "  Cannot install Cilium. Check cluster status:"
-      echo "  - talosctl -n $FIRST_CP_STATIC_IP service kubelet status"
-      echo "  - talosctl -n $FIRST_CP_STATIC_IP service etcd status"
+  if ! poll_until "Waiting for Kubernetes API" 600 10 kubectl get nodes; then
+      echo "⚠ Kubernetes API not ready after 10 minutes — cannot install Cilium"
+      echo "  Check: talosctl -n $FIRST_CP_STATIC_IP service kubelet status"
       exit 1
   fi
 
@@ -1395,7 +1375,7 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
   # Install Cilium with KubePrism configuration
   echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
   cilium install \
-      --version 1.18.2 \
+      --version "$CILIUM_VERSION" \
       --namespace cilium \
       --set ipam.mode=kubernetes \
       --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
@@ -1418,51 +1398,23 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
       --set l2announcements.enabled=true \
       --set loadBalancer.l7.backend=envoy \
       --set hubble.enabled=false
-  # Wait for Cilium to be ready
-  echo "Waiting for Cilium to be ready..."
-  RETRY=0
-  MAX_RETRY=30
-  while [ $RETRY -lt $MAX_RETRY ]; do
-      # Just check if cilium pods are running
-      if kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q "Running"; then
-          echo ""
-          echo "✓ Cilium is ready (${RETRY}0s)"
-          break
-      fi
-      
-      if [ $RETRY -eq 0 ]; then
-          echo -n "Checking Cilium pods"
-      fi
-      
-      if [ $((RETRY % 3)) -eq 0 ] && [ $RETRY -gt 0 ]; then
-          echo -n " [${RETRY}0s]"
-      else
-          echo -n "."
-      fi
-      
-      sleep 10
-      RETRY=$((RETRY+1))
-  done
-
-  if [ $RETRY -eq $MAX_RETRY ]; then
-      echo ""
-      echo "⚠ Warning: Cilium may still be initializing after $((MAX_RETRY * 10))s"
-      echo "  Check status with: cilium status"
-  else
-      # Show Cilium status
-      echo ""
+  if poll_until "Waiting for Cilium pods" 300 10 \
+          bash -c "kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent \
+                   -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running"; then
       cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
+  else
+      echo "⚠ Cilium may still be initializing — check: cilium status"
   fi
 else
   echo -e "\n==> Step 10: Skipping Cilium installation as requested."
 fi
+}
 
-# ==============================================================================
-# Step 11: Install ArgoCD
-# ==============================================================================
+
+phase_install_argocd() {
+# --- Step 11: Install ArgoCD ---
 # Install ArgoCD for GitOps-based application deployment
 # Uses HA manifests and installs Gateway API CRDs
-# ==============================================================================
 
 if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
   echo -e "\n==> Step 11: Installing ArgoCD..."
@@ -1476,13 +1428,13 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
   
   # Install ArgoCD HA components
   echo "Installing ArgoCD (HA mode)..."
-  kubectl -n argocd apply -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/namespace-install.yaml
-  kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.0.19/manifests/ha/install.yaml
+  kubectl -n argocd apply -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/ha/namespace-install.yaml"
+  kubectl apply -n argocd -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/ha/install.yaml"
 
   
   # Install Gateway API CRDs
   echo "Installing Gateway API CRDs..."
-  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/experimental-install.yaml
+  kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
   
   # Wait for ArgoCD server to be ready
   echo "Waiting for ArgoCD server to be ready..."
@@ -1518,10 +1470,11 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
 else
   echo -e "\n==> Step 11: Skipping ArgoCD installation as requested."
 fi
+}
 
-# ==============================================================================
-# 12: Install FluxCD
-# ==============================================================================
+
+phase_install_fluxcd() {
+# --- 12: Install FluxCD ---
 if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 
   echo -e "\n==> Step 12: Installing FluxCD ..."
@@ -1629,10 +1582,11 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 else
     echo -e "\n==> Step 12: Skipping FluxCD installation as requested."
 fi
+}
 
-# ==============================================================================
-# Cleanup temporary files
-# ==============================================================================
+
+phase_cleanup_temp() {
+# --- Cleanup temporary files ---
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo -e "\n==> Cleaning up temporary files..."
@@ -1646,173 +1600,10 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
 
   echo "  ✓ Kept: talosconfig, secrets.yaml, controlplane.yaml, worker.yaml and *-patched.yaml files"
 fi
-
-# =============================================================================
-# 13: Initialize Openbao
-# =============================================================================
-
-# --- Helper Functions for Logging ---
-info() { echo -e "==> $*"; }
-success() { echo -e "✓ $*"; }
-error() { echo -e "❌ Error: $*" >&2; exit 1; }
-
-# --- Spinner and Wait Function ---
-# --- Spinner and Wait Function ---
-wait_with_spinner() {
-    local msg="$1"; shift; local cmd=("$@")
-    
-    # Run command in background
-    "${cmd[@]}" &> /dev/null &
-    local cmd_pid=$!
-
-    # Simple spinner animation
-    tput civis
-    local spin_chars='/-\|'
-    local i=0
-    echo -n "$msg "
-    
-    while kill -0 $cmd_pid 2>/dev/null; do
-        printf "%s" "${spin_chars:i++%${#spin_chars}:1}"
-        sleep 0.2
-        printf "\b"
-    done
-    
-    tput cnorm
-    wait $cmd_pid
-    local exit_code=$?
-    
-    if [ "$exit_code" -eq 0 ]; then
-        echo "✓"
-    else
-        echo "❌"
-        error "Previous step failed."
-    fi
 }
 
-# --- Main Logic Functions ---
 
-ensure_cli_tools_installed() {
-  info "Checking for required tools (kubectl, yq, openssl)..."
-  for cmd in kubectl yq openssl; do
-      if ! command -v "$cmd" &> /dev/null; then
-          error "'$cmd' is not installed or not in your PATH."
-      fi
-  done
-  success "All required tools are present."
-}
-
-ensure_flux_dependencies_ready() {
-    # wait for 20 seconds to allow initial reconciliation
-    sleep 20
-    info "Ensuring OpenBao's Flux dependencies are ready..."
-    local dependencies=("cilium" "cert-manager" "longhorn")
-    
-    for dep in "${dependencies[@]}"; do
-        echo "==> Waiting for $dep HelmRelease..."
-        kubectl wait --for=condition=Ready "helmrelease/$dep" \
-            -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
-
-        sleep 5
-
-        # NEW: Wait for actual pods
-        echo "==> Waiting for $dep pods..."
-        case "$dep" in
-            cilium)
-                kubectl wait --for=condition=Ready pod -l k8s-app=cilium \
-                    -n cilium --timeout=5m
-                ;;
-            cert-manager)
-                kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=cert-manager \
-                    -n cert-manager --timeout=5m
-                ;;
-            longhorn)
-                kubectl wait --for=condition=Ready pod -l app=longhorn-manager \
-                    -n longhorn --timeout=5m
-                ;;
-        esac
-        
-        echo "✓ $dep ready"
-    done
-}
-
-get_config_from_helmrelease() {
-  info "Looking for HelmRelease '${HELMRELEASE_NAME}' in namespace '${HELMRELEASE_NAMESPACE}'..."
-  
-  local retries=10
-  local wait=5
-  for ((i=1; i<=retries; i++)); do
-      if kubectl get helmrelease "${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" &> /dev/null; then
-          success "HelmRelease found."
-          break
-      fi
-      if [[ $i -eq $retries ]]; then
-          error "HelmRelease '${HELMRELEASE_NAME}' not found after ${retries} attempts."
-      fi
-      echo "    (Attempt $i/${retries}) Not found yet. Retrying in ${wait} seconds..."
-      sleep $wait
-  done
-
-  wait_with_spinner "Waiting for Flux to process the HelmRelease spec..." \
-      kubectl wait --for=jsonpath='{.status.observedGeneration}' \
-      "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=2m
-
-  info "Reading configuration from HelmRelease spec..."
-  local hr_yaml
-  hr_yaml=$(kubectl get helmrelease "${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" -o yaml)
-
-  export NAMESPACE=$(echo "$hr_yaml" | yq e '.spec.targetNamespace' -)
-  export SECRET_NAME=$(echo "$hr_yaml" | yq e '.spec.values.server.volumes[0].secret.secretName' -)
-  export SECRET_KEY_NAME=$(echo "$hr_yaml" | yq e '.spec.values.server.volumes[0].secret.items[0].key' -)
-
-  if [[ -z "$NAMESPACE" || -z "$SECRET_NAME" || -z "$SECRET_KEY_NAME" ]]; then
-      error "Failed to read config. Check .spec.targetNamespace and .spec.values.server.volumes."
-  fi
-}
-
-create_unseal_secret() {
-  info "Generating static key and creating secret '${SECRET_NAME}' in '${NAMESPACE}'..."
-  openssl rand 32 | kubectl create secret generic "${SECRET_NAME}" \
-      --namespace="${NAMESPACE}" \
-      --from-file="${SECRET_KEY_NAME}=/dev/stdin" \
-      --dry-run=client -o yaml | kubectl apply -f -
-  success "Secret created. Flux will now reconcile the release."
-}
-
-initialize_bao() {
-  wait_with_spinner "Waiting for HelmRelease to become ready after secret creation..." \
-      kubectl wait --for=condition=ready "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
-
-  local pod_selector="app.kubernetes.io/name=openbao"
-  wait_with_spinner "Waiting for an OpenBao pod to become ready..." \
-      kubectl -n "${NAMESPACE}" wait --for=jsonpath='{.status.phase}'=Running pod -l "${pod_selector}" --timeout=5m
-
-  local pod_name
-  pod_name=$(kubectl get pods -n "${NAMESPACE}" -l "${pod_selector}" -o jsonpath='{.items[0].metadata.name}')
-  success "Found pod '${pod_name}' to perform initialization."
-
-  local init_status
-  init_status=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
-  curl -s http://127.0.0.1:8200/v1/sys/init | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
-
-  info "Checking OpenBao initialization status on pod '${pod_name}'..."
-  if [[ "$init_status" == "true" ]]; then
-      success "OpenBao is already initialized. No action needed."
-  else
-      info "OpenBao is not initialized. Running 'bao operator init' with recovery keys..."
-      local init_output
-      init_output=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" \
-      -- bao operator init \
-      -recovery-shares=5 \
-      -recovery-threshold=3 2>&1)
-      echo -e "\n--- [ OpenBao Initialization Output ] ---\n${init_output}\n-----------------------------------------"
-      echo "${init_output}" > "${OUTPUT_FILE}"
-      success "Initialization complete. Credentials saved to '${OUTPUT_FILE}'."
-      info "IMPORTANT: The file '${OUTPUT_FILE}' contains your root token and recovery keys. Secure it immediately."
-  fi
-}
-
-# --- Script Execution Logic ---
-
+phase_init_openbao() {
 if [ "$SKIP_INIT_OPENBAO" = false ]; then
   # A fully dynamic and robust script to initialize an auto-unsealing OpenBao cluster,
   # featuring a corrected, safe spinner and conditional execution block.
@@ -1848,17 +1639,18 @@ EOF
 else
   echo -e "\n==> Skipping OpenBao initialization as requested."
 fi
+}
 
-# ==============================================================================
-# Final Summary
-# ==============================================================================
+
+print_summary() {
+# --- Final Summary ---
 
 echo -e "\n✅ Cluster setup complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📋 Cluster Summary:"
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-  echo "   • Control nodes: ${CONTROL_NODE_COUNT}"
-  echo "   • Worker nodes: ${WORKER_NODE_COUNT}"
+  echo "   • Control nodes: ${CONTROL_NODE_COUNT:-unknown}"
+  echo "   • Worker nodes: ${WORKER_NODE_COUNT:-unknown}"
   echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
 fi
 if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
@@ -1890,9 +1682,27 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
 fi
 echo "k get pods -A"
 
-# ==============================================================================
-# Disable cleanup trap on successful completion
-# ==============================================================================
+# --- Disable cleanup trap on successful completion ---
 # Script completed successfully, so disable the error cleanup trap
 
 CLEANUP_ON_ERROR=false
+}
+
+
+# --- main ---
+main() {
+    phase_download_images
+    phase_create_vms
+    phase_preflight
+    phase_generate_configs
+    phase_bootstrap
+    phase_install_cilium
+    phase_install_argocd
+    phase_install_fluxcd
+    phase_cleanup_temp
+    phase_init_openbao
+    print_summary
+}
+
+main "$@"
+
