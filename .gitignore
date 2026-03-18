@@ -9,12 +9,21 @@ terraform.tfstate
 *metal-amd64.iso*
 *sha256sum.txt*
 
-*.envrc*
-*.env*
+.env
+.env.*
+.envrc
+*.envrc
 
-*cluster*
+# Talos generated files
 *talosconfig*
-*worker.yaml*
-*controlplane.yaml*
+cluster/controlplane.yaml
+cluster/worker.yaml
+cluster/secrets.yaml
 
+# ArgoCD secrets
+argocd/github-secret.yaml
+argocd/create-repo-secret.sh
+
+# OpenBao credentials output
+openbao-credentials.txt
 openbao-cretentials.txt
