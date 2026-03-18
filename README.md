@@ -1,9 +1,8 @@
-# k8s-cluster-talos
+# ☸️ k8s-cluster-talos
 
-Automated Talos Linux Kubernetes cluster on KVM/libvirt.
-One script provisions VMs, installs Talos, bootstraps Kubernetes and sets up the full stack.
+This repo contains a completely automated bash script that deploys a Talos Linux Kubernetes cluster on KVM/libvirt — 🏗️ Terraform provisioning, 🔒 Cilium CNI, 🔄 FluxCD GitOps, 🌐 Cloudflare external-dns, 💾 Longhorn storage
 
-## Stack
+## 🧱 Stack
 
 | Component | Version | Role |
 |-----------|---------|------|
@@ -17,7 +16,7 @@ One script provisions VMs, installs Talos, bootstraps Kubernetes and sets up the
 | OpenBao | via FluxCD | Secrets management (optional) |
 | Cloudflare | Terraform provider v5 | DNS |
 
-## Topology
+## 🗺️ Topology
 
 Defined in `nodes.yaml` (gitignored — copy from `nodes.yaml.example`):
 
@@ -29,7 +28,7 @@ Defined in `nodes.yaml` (gitignored — copy from `nodes.yaml.example`):
 
 Kubernetes API endpoint: `https://<haproxy-ip>:6443`
 
-## Prerequisites
+## ✅ Prerequisites
 
 - KVM/libvirt installed and running
 - Bridge interface configured (e.g. `br0`)
@@ -38,7 +37,7 @@ Kubernetes API endpoint: `https://<haproxy-ip>:6443`
 - Tools: `yq`, `jq`, `arp-scan`, `talosctl`, `kubectl`
 - `.env` and `nodes.yaml` filled in (see examples below)
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 # 1. Fill in credentials and topology
@@ -55,7 +54,7 @@ cilium status
 
 If `.env` is missing or incomplete, the script will prompt for the required values interactively.
 
-## `.env` Variables
+## 🔑 `.env` Variables
 
 ```bash
 CLUSTER_NAME=talos-cluster
@@ -86,7 +85,7 @@ PIHOLE_SERVER=...
 CLOUDFLARE_API_TOKEN=...
 ```
 
-## Options
+## ⚙️ Options
 
 ```
 ./bootstrap-cluster.sh [OPTIONS]
@@ -106,7 +105,7 @@ CLOUDFLARE_API_TOKEN=...
   --cleanup-all               Destroy everything (VMs + DNS)
 ```
 
-## Bootstrap Flow
+## 🔄 Bootstrap Flow
 
 ```
 bootstrap-cluster.sh
@@ -132,7 +131,7 @@ bootstrap-cluster.sh
   └─ print_summary
 ```
 
-## Upgrade Talos
+## ⬆️ Upgrade Talos
 
 ```bash
 # Generate schematic ID with required extensions
@@ -155,7 +154,7 @@ talosctl -n <control-1>,<control-2>,<control-3>,<worker-1>,<worker-2> \
   --preserve --wait=false
 ```
 
-## File Structure
+## 📁 File Structure
 
 ```
 bootstrap-cluster.sh      Main orchestration script
@@ -171,7 +170,7 @@ docs/                     Component docs (Cilium, Longhorn, ArgoCD, ...)
 .env                      Credentials (gitignored, never commit)
 ```
 
-## Cleanup
+## 🧹 Cleanup
 
 ```bash
 # Remove VMs only (keep Cloudflare DNS)
@@ -181,7 +180,7 @@ docs/                     Component docs (Cilium, Longhorn, ArgoCD, ...)
 ./bootstrap-cluster.sh --cleanup-all
 ```
 
-## ArgoCD App Deployment Order
+## 📦 ArgoCD App Deployment Order
 
 When deploying via ArgoCD, install in this order:
 
@@ -194,19 +193,19 @@ When deploying via ArgoCD, install in this order:
 7. gateway-api
 8. argocd-apps
 
-## Notes / Known Issues
+## ⚠️ Notes / Known Issues
 
-**Terraform Cloud — Local Execution required**
+**⚡ Terraform Cloud — Local Execution required**
 The libvirt provider doesn't work with Remote execution. Set the workspace to _Local Execution_ in Terraform Cloud settings, otherwise you'll get:
 ```
 Error: failed to connect: dial unix /var/run/libvirt/libvirt-sock: connect: no such file or directory
 ```
 
-**cloud-init config must be a single line**
+**📄 cloud-init config must be a single line**
 Multi-line cloud-init user data breaks with the libvirt Terraform provider — keep it inline.
 
-**`prevent_destroy` lifecycle block**
+**🔒 `prevent_destroy` lifecycle block**
 Setting `prevent_destroy = var.some_bool` doesn't work in Terraform. To toggle it, remove the block from the `.tf` file directly and re-apply.
 
-**Talos kernel parameters cause kernel panic**
+**💥 Talos kernel parameters cause kernel panic**
 Don't pass `kernel`/`cmdline` parameters via the libvirt Terraform provider — results in kernel panic on boot.
