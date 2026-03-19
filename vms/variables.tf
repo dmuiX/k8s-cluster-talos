@@ -49,3 +49,9 @@ variable "github_owner" {
   description = "GitHub username or organization for repo URLs and SSH key import."
   type        = string
 }
+
+variable "enable_cloudflare" {
+  description = "Enable Cloudflare DNS record creation. Set to false to skip."
+  type        = bool
+  default     = true
+}

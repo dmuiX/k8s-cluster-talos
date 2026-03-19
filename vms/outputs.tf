@@ -1,6 +1,6 @@
 output "zone_id" {
   description = "The Cloudflare Zone ID"
-  value       = data.cloudflare_zone.cloudflare_zone.zone_id
+  value       = var.enable_cloudflare ? data.cloudflare_zone.cloudflare_zone[0].zone_id : null
 }
 
 output "domain_name" {

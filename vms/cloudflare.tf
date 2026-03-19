@@ -1,4 +1,5 @@
 data "cloudflare_zone" "cloudflare_zone" {
+  count = var.enable_cloudflare ? 1 : 0
   filter = {
     name = var.cloudflare_zone_name
   }
@@ -6,8 +7,8 @@ data "cloudflare_zone" "cloudflare_zone" {
 
 # Create Cloudflare DNS records dynamically for nodes
 resource "cloudflare_dns_record" "node_dns" {
-  for_each = { for node in local.all_nodes : node.name => node }
-  zone_id  = data.cloudflare_zone.cloudflare_zone.zone_id
+  for_each = var.enable_cloudflare ? { for node in local.all_nodes : node.name => node } : {}
+  zone_id  = data.cloudflare_zone.cloudflare_zone[0].zone_id
   name     = "${each.value.name}.${var.cloudflare_zone_name}"
   type     = "A"
   content  = each.value.ip
