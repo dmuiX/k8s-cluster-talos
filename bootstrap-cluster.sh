@@ -1025,7 +1025,7 @@ echo "Checking HAProxy at ${HAPROXY_IP}:6443..."
 if ! poll_until "Waiting for HAProxy on port 6443" 360 10 \
         bash -c "nc -z -w 5 \"$HAPROXY_IP\" 6443 || echo > /dev/tcp/${HAPROXY_IP}/6443"; then
     echo "⚠ Warning: HAProxy not responding after 6 minutes — continuing anyway"
-    echo "  Check HAProxy logs: ssh ubuntu@${HAPROXY_IP}"
+    echo "  Check HAProxy logs: ssh lb_user@${HAPROXY_IP}"
 fi
 
 echo -e "\n==> Step 7: Applying configurations to nodes..."

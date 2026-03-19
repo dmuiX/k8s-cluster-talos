@@ -5,7 +5,7 @@ reboot_if_required: true
 
 growpart:
   mode: auto
-  devices: ['/']
+  devices: ["/"]
 
 resize_rootfs: true
 
@@ -13,15 +13,17 @@ packages:
   - haproxy
   - unattended-upgrades
   - ssh-import-id
+  - zsh
+  - qemu-guest-agent
 
 chpasswd:
   expire: false
   users:
-    - {name: "${username}", password: "${user_password}", type: text}
+    - { name: "${username}", password: "${user_password}", type: text }
 
 write_files:
   - path: /etc/haproxy/haproxy.cfg
-    permissions: '0644'
+    permissions: "0644"
     content: |
       global
           log /dev/log    local0
@@ -88,6 +90,9 @@ runcmd:
   - sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
   - systemctl restart sshd
 
+  # Import SSH keys from GitHub
+  - sudo -u ${username} ssh-import-id gh:${github_owner}
+
   # Clone dotfiles repo
   - sudo -u ${username} -H sh -c "git clone https://github.com/${github_owner}/dotnet-files-linux.git /home/${username}/.dotfiles || true"
 
@@ -114,6 +119,5 @@ users:
   - default
   - name: ${username}
     sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /usr/bin/zsh
-    ssh_import_id: ['gh:${github_owner}']
+    shell: /bin/bash
     groups: sudo

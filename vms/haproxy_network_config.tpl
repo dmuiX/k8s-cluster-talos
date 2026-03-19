@@ -4,4 +4,8 @@ ethernets:
     dhcp4: no
     addresses:
       - ${ip_address}/24
-    gateway4: ${gateway}
+    nameservers:
+      addresses: ${jsonencode(nameservers)}
+    routes:
+      - to: default
+        via: ${gateway}
