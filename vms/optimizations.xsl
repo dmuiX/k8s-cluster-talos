@@ -47,4 +47,9 @@
       <feature policy="require" name="topoext"/>
     </cpu>
   </xsl:template>
+
+  <!-- Restart on crash instead of destroy -->
+  <xsl:template match="/domain/on_crash">
+    <on_crash>restart</on_crash>
+  </xsl:template>
 </xsl:stylesheet>
