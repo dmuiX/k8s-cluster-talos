@@ -737,30 +737,27 @@ UBUNTU_CHECKSUM_URL="${UBUNTU_CHECKSUM_URL:-}"
 credentials_prompt
 
 # Auto-detect running cluster — set SKIP_* flags if cluster already exists
-# Only auto-detect if user hasn't explicitly passed any skip flags
-if [ "$SKIP_BOOTSTRAP" = false ] && [ "$SKIP_TERRAFORM" = false ] && [ "$SKIP_CONFIG_CREATION" = false ]; then
-    if [ -f "$CLUSTER_DIR/talosconfig" ] && \
-       TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get nodes &>/dev/null 2>&1; then
-        echo "==> Existing cluster detected — skipping ISO download, VM creation, config generation and bootstrap."
-        SKIP_ISO_DOWNLOAD=true
-        SKIP_TERRAFORM=true
-        SKIP_CONFIG_CREATION=true
-        SKIP_BOOTSTRAP=true
-        # Check if Cilium is already installed
-        if TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get ns cilium &>/dev/null 2>&1; then
-            echo "==> Cilium already installed — skipping."
-            SKIP_CILIUM_INSTALLATION=true
-        fi
-        # Check if ArgoCD is already installed
-        if TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get ns argocd &>/dev/null 2>&1; then
-            echo "==> ArgoCD already installed — skipping."
-            SKIP_ARGOCD_INSTALLATION=true
-        fi
-        # Check if FluxCD is already installed
-        if TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get ns flux-system &>/dev/null 2>&1; then
-            echo "==> FluxCD already installed — skipping."
-            SKIP_FLUXCD_INSTALLATION=true
-        fi
+if [ "$SKIP_BOOTSTRAP" = false ] && [ -f "$CLUSTER_DIR/talosconfig" ] && \
+   kubectl get nodes &>/dev/null 2>&1; then
+    echo "==> Existing cluster detected — skipping ISO download, VM creation, config generation and bootstrap."
+    SKIP_ISO_DOWNLOAD=true
+    SKIP_TERRAFORM=true
+    SKIP_CONFIG_CREATION=true
+    SKIP_BOOTSTRAP=true
+    # Check if Cilium is fully running (not just namespace exists)
+    if kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; then
+        echo "==> Cilium already running — skipping."
+        SKIP_CILIUM_INSTALLATION=true
+    fi
+    # Check if ArgoCD is already installed
+    if kubectl get ns argocd &>/dev/null 2>&1; then
+        echo "==> ArgoCD already installed — skipping."
+        SKIP_ARGOCD_INSTALLATION=true
+    fi
+    # Check if FluxCD is already installed
+    if kubectl get ns flux-system &>/dev/null 2>&1; then
+        echo "==> FluxCD already installed — skipping."
+        SKIP_FLUXCD_INSTALLATION=true
     fi
 fi
 
