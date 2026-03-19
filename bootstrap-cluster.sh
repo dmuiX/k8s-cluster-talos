@@ -736,6 +736,19 @@ UBUNTU_CHECKSUM_URL="${UBUNTU_CHECKSUM_URL:-}"
 
 credentials_prompt
 
+# Auto-detect running cluster — set SKIP_* flags if cluster already exists
+# Only auto-detect if user hasn't explicitly passed any skip flags
+if [ "$SKIP_BOOTSTRAP" = false ] && [ "$SKIP_TERRAFORM" = false ] && [ "$SKIP_CONFIG_CREATION" = false ]; then
+    if [ -f "$CLUSTER_DIR/talosconfig" ] && \
+       TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get nodes &>/dev/null 2>&1; then
+        echo "==> Existing cluster detected — skipping ISO download, VM creation, config generation and bootstrap."
+        SKIP_ISO_DOWNLOAD=true
+        SKIP_TERRAFORM=true
+        SKIP_CONFIG_CREATION=true
+        SKIP_BOOTSTRAP=true
+    fi
+fi
+
 if [[ "$DEBUG" == "true" ]]; then
     echo "--- DEBUG MODE ENABLED ---"
     set -x
@@ -1326,8 +1339,10 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
           talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force; then
       echo "✗ Failed to retrieve kubeconfig after 200s — try manually: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
   fi
+  export KUBECONFIG="${HOME}/.kube/config"
 else
   echo -e "\n==> Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
+  export KUBECONFIG="${HOME}/.kube/config"
 fi
 }
 
