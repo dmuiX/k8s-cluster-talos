@@ -751,6 +751,16 @@ if [ "$SKIP_BOOTSTRAP" = false ] && [ "$SKIP_TERRAFORM" = false ] && [ "$SKIP_CO
             echo "==> Cilium already installed — skipping."
             SKIP_CILIUM_INSTALLATION=true
         fi
+        # Check if ArgoCD is already installed
+        if TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get ns argocd &>/dev/null 2>&1; then
+            echo "==> ArgoCD already installed — skipping."
+            SKIP_ARGOCD_INSTALLATION=true
+        fi
+        # Check if FluxCD is already installed
+        if TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get ns flux-system &>/dev/null 2>&1; then
+            echo "==> FluxCD already installed — skipping."
+            SKIP_FLUXCD_INSTALLATION=true
+        fi
     fi
 fi
 
