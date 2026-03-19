@@ -58,14 +58,12 @@ If `.env` is missing or incomplete, the script will prompt for the required valu
 
 ```bash
 CLUSTER_NAME=talos-cluster
-VMS_DIR=./vms
-CLUSTER_DIR=./cluster
-NODES_FILE_PATH=./nodes.yaml
+# VMS_DIR, CLUSTER_DIR, NODES_FILE_PATH are auto-set relative to the script — no need to define them here
 
 TALOS_ISO_URL=https://...
 TALOS_CHECKSUM_URL=https://...
-UBUNTU_IMAGE_URL=https://...
-UBUNTU_CHECKSUM_URL=https://...
+UBUNTU_IMAGE_URL=https://cloud-images.ubuntu.com/daily/server/noble/20260307/noble-server-cloudimg-amd64.img
+UBUNTU_CHECKSUM_URL=https://cloud-images.ubuntu.com/daily/server/noble/20260307/SHA256SUMS
 METALISO_ABSOLUTE_PATH=./vms/metal-amd64.iso
 UBUNTU_IMAGE_PATH=./vms/ubuntu.img
 
@@ -98,6 +96,7 @@ CLOUDFLARE_API_TOKEN=...
   --skip-argocd-installation  Skip ArgoCD
   --skip-fluxcd-installation  Skip FluxCD
   --skip-init-openbao         Skip OpenBao initialization
+  --skip-cloudflare           Skip Cloudflare DNS record creation (no API token needed)
 
   --debug                     Enable bash -x tracing
   --no-cleanup                Disable automatic cleanup on error
@@ -195,6 +194,20 @@ When deploying via ArgoCD, install in this order:
 
 ## ⚠️ Notes / Known Issues
 
+**🚫 Do not set `VMS_DIR`, `CLUSTER_DIR` or `NODES_FILE_PATH` in `.env`**
+The script automatically derives all paths from its own location (`BASH_SOURCE[0]`). Any of these in `.env` are ignored — the script enforces them after sourcing. Setting them via `PWD=$(pwd)` in `.env` used to cause them to resolve to `/` in subshells, leading to configs written to the wrong directory and TLS certificate mismatches (`x509: certificate signed by unknown authority`).
+
+**🚫 Always run the script from any directory — paths are BASH_SOURCE-relative**
+The script can be called from any working directory (e.g. `bash /path/to/bootstrap-cluster.sh` or `cd / && ./k8s-cluster-talos/bootstrap-cluster.sh`). All paths — including `.env` loading, `CLUSTER_DIR`, `VMS_DIR`, and `NODES_FILE_PATH` — are resolved relative to the script file itself, not the caller's `$PWD`.
+
+**📌 Pin the Ubuntu image URL — do not use `current`**
+Using `current` in the Ubuntu image URL always pulls the latest daily build, which can introduce breaking changes (e.g. `gateway4` removed in netplan, stricter cloud-init schema validation). Always use a specific dated build:
+```
+UBUNTU_IMAGE_URL=https://cloud-images.ubuntu.com/daily/server/noble/20260307/noble-server-cloudimg-amd64.img
+UBUNTU_CHECKSUM_URL=https://cloud-images.ubuntu.com/daily/server/noble/20260307/SHA256SUMS
+```
+Update the date only when you intentionally want to upgrade and have tested the new image.
+
 **⚡ Terraform Cloud — Local Execution required**
 The libvirt provider doesn't work with Remote execution. Set the workspace to _Local Execution_ in Terraform Cloud settings, otherwise you'll get:
 ```
@@ -209,3 +222,8 @@ Setting `prevent_destroy = var.some_bool` doesn't work in Terraform. To toggle i
 
 **💥 Talos kernel parameters cause kernel panic**
 Don't pass `kernel`/`cmdline` parameters via the libvirt Terraform provider — results in kernel panic on boot.
+
+---
+
+> **Note:** This project was developed with the assistance of [Claude Code](https://claude.ai/claude-code).
+> Tested for functionality.

@@ -90,3 +90,5 @@ Dont touch files that stand in .gitignore
 - No hardcoded secrets in any committed file.
 - No broad rewrites — small focused edits only.
 - No Co-Author in Git commits!
+- DO NOT READ .env!
+- 
