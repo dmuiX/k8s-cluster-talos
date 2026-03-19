@@ -14,3 +14,15 @@ flux bootstrap github \
   --path=clusters \
   --personal \
   --private=true
+
+## github permossions fluxcd repo
+
+Für FluxCD Bootstrap auf einem private repo brauchst du:
+
+Contents: Read & Write (Flux pusht seine Manifeste ins Repo)
+Metadata: Read (immer required)
+Wenn du auch Webhooks willst (damit Flux bei Push sofort reconciled):
+
+Webhooks: Read & Write
+Das war's. Kein Admin, kein Actions, nix anderes.
+
