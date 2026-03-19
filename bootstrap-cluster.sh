@@ -383,8 +383,9 @@ EOF
         #    turn `nameservers: ${NAMESERVERS_ARRAY}` into a string.
         # 2. `... | .machine.network.nameservers = ...`: This second part FIXES the nameservers
         #    field by overwriting it with a properly parsed and formatted block-style array.
-        yq '(.. | select(tag == "!!str")) |= envsubst | 
-            .machine.network.nameservers = (env(NAMESERVERS_ARRAY) | .. style="")' \
+        yq '(.. | select(tag == "!!str")) |= envsubst |
+            .machine.network.nameservers = (env(NAMESERVERS_ARRAY) | .. style="") |
+            .cluster.allowSchedulingOnControlPlanes |= (. == "true")' \
           "$template_file" > "$patch_file"
                         
         # Apply patch
@@ -575,7 +576,7 @@ initialize_bao() {
 
   local init_status
   init_status=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
-  curl -s http://127.0.0.1:8200/v1/sys/init | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
+  wget -qO- http://127.0.0.1:8200/v1/sys/init 2>/dev/null | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
 
   info "Checking OpenBao initialization status on pod '${pod_name}'..."
   if [[ "$init_status" == "true" ]]; then
@@ -646,6 +647,77 @@ fi
 VMS_DIR="$SCRIPT_DIR/vms"
 CLUSTER_DIR="$SCRIPT_DIR/cluster"
 NODES_FILE_PATH="$SCRIPT_DIR/nodes.yaml"
+
+# --- Generate nodes.yaml from .env topology variables ---
+generate_nodes_yaml() {
+    local file="$NODES_FILE_PATH"
+    echo "==> Generating nodes.yaml from .env topology..."
+
+    cat > "$file" <<YAML
+nodes:
+  - name: "haproxy"
+    ip: "${HAPROXY_IP}"
+    gateway: "${GATEWAY}"
+    nameservers:
+$(IFS=','; for ns in $NAMESERVERS; do echo "      - \"$ns\""; done)
+    vcpus: ${HAPROXY_VCPUS:-1}
+    memory_mib: ${HAPROXY_MEMORY_MIB:-768}
+    disk_size_gib: ${HAPROXY_DISK_GIB:-20}
+    role: "haproxy"
+YAML
+
+    # Generate control plane nodes
+    local base_ip="${CP_BASE_IP}"
+    local ip_prefix="${base_ip%.*}"
+    local ip_start="${base_ip##*.}"
+
+    for i in $(seq 1 "${CP_COUNT}"); do
+        local ip="${ip_prefix}.$((ip_start + i - 1))"
+        cat >> "$file" <<YAML
+
+  - name: "control-node-${i}"
+    ip: "${ip}"
+    gateway: "${GATEWAY}"
+    nameservers:
+$(IFS=','; for ns in $NAMESERVERS; do echo "      - \"$ns\""; done)
+    vcpus: ${CP_VCPUS:-4}
+    memory_mib: ${CP_MEMORY_MIB:-8192}
+    disk_size_gib: ${CP_DISK_GIB:-50}
+    role: "control-node"
+YAML
+    done
+
+    # Generate worker nodes
+    if [ "${WORKER_COUNT:-0}" -gt 0 ]; then
+        local w_base_ip="${WORKER_BASE_IP}"
+        local w_ip_prefix="${w_base_ip%.*}"
+        local w_ip_start="${w_base_ip##*.}"
+
+        for i in $(seq 1 "${WORKER_COUNT}"); do
+            local ip="${w_ip_prefix}.$((w_ip_start + i - 1))"
+            cat >> "$file" <<YAML
+
+  - name: "worker-node-${i}"
+    ip: "${ip}"
+    gateway: "${GATEWAY}"
+    nameservers:
+$(IFS=','; for ns in $NAMESERVERS; do echo "      - \"$ns\""; done)
+    vcpus: ${WORKER_VCPUS:-4}
+    memory_mib: ${WORKER_MEMORY_MIB:-6144}
+    disk_size_gib: ${WORKER_DISK_GIB:-255}
+    role: "worker-node"
+YAML
+        done
+    fi
+
+    echo "  ✓ Generated $file (${CP_COUNT} CP + ${WORKER_COUNT:-0} Worker + HAProxy)"
+}
+
+# Generate nodes.yaml if topology variables are set
+if [ -n "${CP_COUNT:-}" ] && [ -n "${HAPROXY_IP:-}" ]; then
+    generate_nodes_yaml
+fi
+
 # --- Parse Command-Line Arguments ---
 
 SKIP_TERRAFORM=false
@@ -733,6 +805,10 @@ METALISO_ABSOLUTE_PATH="${METALISO_ABSOLUTE_PATH:-$VMS_DIR/metal-amd64.iso}"
 TALOS_CHECKSUM_URL="${TALOS_CHECKSUM_URL:-https://github.com/siderolabs/talos/releases/latest/download/sha256sum.txt}"
 UBUNTU_IMAGE_PATH="${UBUNTU_IMAGE_PATH:-/var/lib/libvirt/images/ubuntu-noble-cloudimg-amd64.img}"
 UBUNTU_CHECKSUM_URL="${UBUNTU_CHECKSUM_URL:-}"
+
+# Control plane scheduling — can be overridden in .env
+# Auto-detected in main() based on worker node count if not set
+export ALLOW_SCHEDULING_ON_CONTROL_PLANES="${ALLOW_SCHEDULING_ON_CONTROL_PLANES:-auto}"
 
 credentials_prompt
 
@@ -968,7 +1044,7 @@ if [ "$SKIP_CONFIG_CREATION" = false ]; then
 
     echo -e "\n==> Step 3c: Generating machine configurations..."
 
-    if [ -f "controlplane.yaml" ] || [ -f "worker.yaml" ]; then
+    if [ -f "controlplane.yaml" ]; then
         echo "⚠ Warning: Machine configurations already exist!"
         echo "  This will regenerate configs and may break access to existing cluster."
         read -p "Do you want to overwrite them? (yes/no): " -r
@@ -979,12 +1055,18 @@ if [ "$SKIP_CONFIG_CREATION" = false ]; then
             echo "Regenerating configs..."
             rm -f controlplane.yaml worker.yaml 2>/dev/null
             talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
-            echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
+            echo "  ✓ Generated machine configurations with install disk: $INSTALL_DISK"
         fi
     else
         # First time generation
         talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
-        echo "  ✓ Generated 'controlplane.yaml' and 'worker.yaml' with install disk: $INSTALL_DISK"
+        echo "  ✓ Generated machine configurations with install disk: $INSTALL_DISK"
+    fi
+
+    # Remove worker.yaml if no workers configured (talosctl always generates both)
+    if [ "${WORKER_NODE_COUNT:-0}" -eq 0 ] && [ -f "worker.yaml" ]; then
+        rm -f worker.yaml
+        echo "  ✓ Removed worker.yaml (no worker nodes configured)"
     fi
 else
     echo -e "\n==> Step 3: Skipping config generation (--skip-config-creation flag set)"
@@ -1020,7 +1102,9 @@ else
 
     # Use the new helper function to create patch files.
     generate_patch_files_by_role "control-node"
-    generate_patch_files_by_role "worker-node"
+    if [ "$WORKER_NODE_COUNT" -gt 0 ]; then
+        generate_patch_files_by_role "worker-node"
+    fi
 fi
 }
 
@@ -1145,9 +1229,13 @@ WORKER_IPS=$(echo "$DYNAMIC_IPS" | grep '^worker-node' || true)
 echo -e "\n==> Step 7: Installing Talos on all nodes (parallel)..."
 
 # Combine all node IPs for parallel installation
-ALL_NODE_IPS=$(printf "%s\n%s" "$CONTROL_IPS" "$WORKER_IPS")
+if [ -n "$WORKER_IPS" ]; then
+    ALL_NODE_IPS=$(printf "%s\n%s" "$CONTROL_IPS" "$WORKER_IPS")
+else
+    ALL_NODE_IPS="$CONTROL_IPS"
+fi
 
-echo -e "\nApplying config to all nodes (control + workers) in parallel:"
+echo -e "\nApplying config to all nodes in parallel:"
 
 if [ -z "$ALL_NODE_IPS" ]; then
   echo "ERROR: No nodes found in discovered IPs!" >&2
@@ -1320,7 +1408,7 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
 
       # Get worker static IPs
       WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-      
+
       FIRST_WORKER_READY=""
       for ip in $WORKER_STATIC_IPS; do
           if poll_until "Checking worker $ip" 90 2 talosctl -n "$ip" version --client=false; then
@@ -1333,7 +1421,7 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
           && echo "✓ Worker nodes are ready and will join the cluster" \
           || echo "⚠ No worker nodes ready after 90s — check: kubectl get nodes"
   else
-      echo -e "\n⚠ No worker nodes found to verify"
+      echo "==> Step 8b: No worker nodes configured — skipping."
   fi
 else
   echo -e "\n==> Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
@@ -1748,6 +1836,17 @@ main() {
     CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
     WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
     K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
+
+    # Auto-detect scheduling on control planes if not explicitly set
+    if [ "$ALLOW_SCHEDULING_ON_CONTROL_PLANES" = "auto" ]; then
+        if [ "$WORKER_NODE_COUNT" -eq 0 ]; then
+            ALLOW_SCHEDULING_ON_CONTROL_PLANES="true"
+            echo "==> No worker nodes configured — enabling scheduling on control planes."
+        else
+            ALLOW_SCHEDULING_ON_CONTROL_PLANES="false"
+        fi
+        export ALLOW_SCHEDULING_ON_CONTROL_PLANES
+    fi
 
     phase_download_images
     phase_create_vms
