@@ -7,8 +7,7 @@
 # Prerequisites:
 #   - KVM/libvirt installed and running
 #   - Bridge network configured (e.g., br0)
-#   - Cloudflare account with API token
-#   - terraform cloud account with API Token or some other way to store the state file
+#   - Cloudflare account with API token (optional, use --skip-cloudflare to skip)
 #   - .env file with required variables (see .env.example)
 #   - .envrc file for direnv and manual terraform deployment (optional)
 #   - nodes.yaml file with node definitions
@@ -36,6 +35,7 @@
 #     --skip-argocd-installation  Skip ArgoCD installation
 #     --skip-fluxcd-installation  Skip FluxCD installation
 #     --skip-init-openbao  Skip initializing OpenBao
+#     --skip-cloudflare       Skip Cloudflare DNS record creation
 #     --debug                 Enable verbose bash debug mode (set -x)
 #     --no-cleanup            Disable automatic terraform destroy on error
 #     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
@@ -67,6 +67,7 @@ OPTIONS:
     --skip-argocd-installation  Skip ArgoCD installation
     --skip-fluxcd-installation  Skip FluxCD installation
     --skip-init-openbao         Skip initializing OpenBao
+    --skip-cloudflare           Skip Cloudflare DNS record creation
     --debug                     Enable verbose bash debug mode (set -x)
     --no-cleanup                Disable automatic terraform destroy on error
     --cleanup-vms               Destroy only VMs (keeps Cloudflare DNS records)
@@ -91,7 +92,7 @@ EXAMPLES:
 PREREQUISITES:
     - KVM/libvirt installed and running
     - Bridge network configured (e.g., br0)
-    - Cloudflare account with API token
+    - Cloudflare account with API token (optional, use --skip-cloudflare)
     - .env file with required variables
     - nodes.yaml file with node definitions
 
@@ -151,10 +152,6 @@ trap cleanup_on_error EXIT
 
 # --- Initial Setup and Configuration ---
 
-# Store current working directory (project root)
-pwd=$(pwd)
-echo "Current working directory: $pwd"
-
 # Determine if we need sudo for privileged operations
 # SUDO variable is used throughout the script for commands requiring root
 if [ "$EUID" -ne 0 ]; then
@@ -179,7 +176,7 @@ cleanup_vms_only() {
     fi
 
     # Locate nodes file (use env var or default)
-    local nodes_file_path="${NODES_FILE_PATH:-../nodes.yaml}"
+    local nodes_file_path="${NODES_FILE_PATH:-$SCRIPT_DIR/nodes.yaml}"
     if [ ! -f "$nodes_file_path" ]; then
         echo "Warning: Nodes file not found at $nodes_file_path. Cannot perform cleanup."
         return 1
@@ -361,10 +358,10 @@ EOF
 
         local template_file base_config
         if [ "$role" == "control-node" ]; then
-            template_file="$pwd/templates/control-node-patch.yaml"
+            template_file="$SCRIPT_DIR/templates/control-node-patch.yaml"
             base_config="controlplane.yaml"
         else
-            template_file="$pwd/templates/worker-node-patch.yaml"
+            template_file="$SCRIPT_DIR/templates/worker-node-patch.yaml"
             base_config="worker.yaml"
         fi
 
@@ -444,7 +441,7 @@ poll_until() {
 # --- Helper Functions for Logging ---
 info() { echo -e "==> $*"; }
 success() { echo -e "✓ $*"; }
-error() { echo -e "❌ Error: $*" >&2; exit 1; }
+error() { echo -e "✗ Error: $*" >&2; exit 1; }
 
 # --- Spinner and Wait Function ---
 wait_with_spinner() {
@@ -473,7 +470,7 @@ wait_with_spinner() {
     if [ "$exit_code" -eq 0 ]; then
         echo "✓"
     else
-        echo "❌"
+        echo "✗"
         error "Previous step failed."
     fi
 }
@@ -599,8 +596,9 @@ initialize_bao() {
 
 credentials_prompt() {
     local need=false
-    for var in CLUSTER_NAME VMS_DIR CLUSTER_DIR NODES_FILE_PATH \
-               TALOS_ISO_URL UBUNTU_IMAGE_URL TF_VAR_cloudflare_api_token; do
+    local required_vars="CLUSTER_NAME VMS_DIR CLUSTER_DIR NODES_FILE_PATH TALOS_ISO_URL UBUNTU_IMAGE_URL"
+    [ "${SKIP_CLOUDFLARE:-false}" = false ] && required_vars="$required_vars TF_VAR_cloudflare_api_token"
+    for var in $required_vars; do
         [ -z "${!var:-}" ] && need=true && break
     done
     [ "$need" = false ] && return 0
@@ -618,34 +616,36 @@ credentials_prompt() {
     }
 
     _ask CLUSTER_NAME             "Cluster name"              "talos-cluster"
-    _ask VMS_DIR                  "Terraform/VMs directory"   "$(pwd)/vms"
-    _ask CLUSTER_DIR              "Talos config directory"    "$(pwd)/cluster"
-    _ask NODES_FILE_PATH          "Path to nodes.yaml"        "$(pwd)/nodes.yaml"
+    _ask VMS_DIR                  "Terraform/VMs directory"   "$SCRIPT_DIR/vms"
+    _ask CLUSTER_DIR              "Talos config directory"    "$SCRIPT_DIR/cluster"
+    _ask NODES_FILE_PATH          "Path to nodes.yaml"        "$SCRIPT_DIR/nodes.yaml"
     _ask TALOS_ISO_URL            "Talos ISO URL"             ""
     _ask UBUNTU_IMAGE_URL         "Ubuntu cloud image URL"    ""
-    _ask TF_VAR_cloudflare_api_token "Cloudflare API token"  ""
+    [ "${SKIP_CLOUDFLARE:-false}" = false ] && _ask TF_VAR_cloudflare_api_token "Cloudflare API token"  ""
     echo ""
 }
 
 # --- Initialization ---
 
 # --- Load Environment Variables ---
-# Load configuration from .env file if it exists
-# Expected variables:
-#   - CLUSTER_NAME: Name of the Kubernetes cluster
-#   - VMS_DIR: Directory containing Terraform configs
-#   - CLUSTER_DIR: Directory for Talos configs
-#   - NODES_FILE_PATH: Path to nodes.yaml
-#   - TALOS_ISO_URL, UBUNTU_IMAGE_URL: Download URLs
-#   - TF_VAR_*: Terraform variables (Cloudflare, libvirt, etc.)
+# Paths (VMS_DIR, CLUSTER_DIR, NODES_FILE_PATH) are auto-set from SCRIPT_DIR.
+# .env provides: CLUSTER_NAME, TALOS_ISO_URL, UBUNTU_IMAGE_URL, TF_VAR_*, etc.
 
-if [ -f .env ]; then
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VMS_DIR="$SCRIPT_DIR/vms"
+CLUSTER_DIR="$SCRIPT_DIR/cluster"
+NODES_FILE_PATH="$SCRIPT_DIR/nodes.yaml"
+
+if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a  # Automatically export all variables
-    source .env
+    source "$SCRIPT_DIR/.env"
     set +a  # Disable auto-export
 fi
-credentials_prompt
 
+# Always enforce script-relative paths (prevent PWD=$(pwd) bugs in .env)
+VMS_DIR="$SCRIPT_DIR/vms"
+CLUSTER_DIR="$SCRIPT_DIR/cluster"
+NODES_FILE_PATH="$SCRIPT_DIR/nodes.yaml"
 # --- Parse Command-Line Arguments ---
 
 SKIP_TERRAFORM=false
@@ -656,6 +656,7 @@ SKIP_CILIUM_INSTALLATION=false
 SKIP_ARGOCD_INSTALLATION=true
 SKIP_FLUXCD_INSTALLATION=false
 SKIP_INIT_OPENBAO=false
+SKIP_CLOUDFLARE=false
 DEBUG=false
 
 for arg in "$@"; do
@@ -665,44 +666,37 @@ for arg in "$@"; do
             ;;
         --skip-iso-download)
             SKIP_ISO_DOWNLOAD=true
-            shift
             ;;
         --skip-terraform)
             SKIP_TERRAFORM=true
-            shift
             ;;
         --skip-config-creation)
             SKIP_CONFIG_CREATION=true
-            shift
             ;;
         --skip-bootstrap)
             SKIP_BOOTSTRAP=true
-            shift
             ;;
         --skip-cilium-installation)
             SKIP_CILIUM_INSTALLATION=true
-            shift
             ;;
         --skip-argocd-installation)
             SKIP_ARGOCD_INSTALLATION=true
-            shift
             ;;
         --skip-fluxcd-installation)
             SKIP_FLUXCD_INSTALLATION=true
-            shift
             ;;
         --skip-init-openbao)
             SKIP_INIT_OPENBAO=true
-            shift
+            ;;
+        --skip-cloudflare)
+            SKIP_CLOUDFLARE=true
             ;;
         --debug)
             DEBUG=true
-            shift
             ;;
         --no-cleanup)
             CLEANUP_ON_ERROR=false
             echo "Automatic cleanup on error is disabled."
-            shift
             ;;
         --cleanup-vms)
             cleanup_vms_only
@@ -734,20 +728,18 @@ for arg in "$@"; do
     esac
 done
 
+# Set defaults for download paths/URLs if not set by .env
+METALISO_ABSOLUTE_PATH="${METALISO_ABSOLUTE_PATH:-$VMS_DIR/metal-amd64.iso}"
+TALOS_CHECKSUM_URL="${TALOS_CHECKSUM_URL:-https://github.com/siderolabs/talos/releases/latest/download/sha256sum.txt}"
+UBUNTU_IMAGE_PATH="${UBUNTU_IMAGE_PATH:-/var/lib/libvirt/images/ubuntu-noble-cloudimg-amd64.img}"
+UBUNTU_CHECKSUM_URL="${UBUNTU_CHECKSUM_URL:-}"
+
+credentials_prompt
+
 if [[ "$DEBUG" == "true" ]]; then
     echo "--- DEBUG MODE ENABLED ---"
     set -x
 fi
-
-# --- Cluster Topology (read once from nodes.yaml) ---
-HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
-set +o pipefail
-FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
-set -o pipefail
-CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
-K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
 
 # --- Phases ---
 
@@ -815,6 +807,10 @@ if [ "$SKIP_TERRAFORM" = false ]; then
     echo "Initializing and applying Terraform Cloudflare configuration."
     
     terraform init -input=false
+    if [ "$SKIP_CLOUDFLARE" = true ]; then
+        echo "Skipping Cloudflare DNS records as requested."
+        export TF_VAR_enable_cloudflare=false
+    fi
     if ! terraform apply; then
         echo "Terraform apply failed."
         echo "cleaning up created VMs..."
@@ -876,7 +872,7 @@ echo "==> Step 2a: Performing pre-flight checks..."
 if ! command -v yq &> /dev/null; then echo "yq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y yq; fi
 if ! command -v jq &> /dev/null; then echo "jq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y jq; fi
 if ! command -v curl &> /dev/null; then echo "curl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y curl; fi
-if ! command -v arp-scan &> /dev/null; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
+if ! command -v arp-scan &> /dev/null && ! [ -x /usr/sbin/arp-scan ]; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
 if ! command -v mkisofs &> /dev/null && ! command -v genisoimage &> /dev/null; then
     echo "genisoimage not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y genisoimage
 fi
@@ -892,8 +888,6 @@ if ! command -v helm &> /dev/null; then
     echo "helm not found, installing..."
     curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | $SUDO bash
 fi
-
-cd "$CLUSTER_DIR"
 }
 
 
@@ -904,6 +898,8 @@ phase_generate_configs() {
 #   - Base machine configs for control plane and workers
 #   - Configure Kubernetes API endpoint (HAProxy IP)
 # Only run if NOT skipping config creation
+
+cd "$CLUSTER_DIR"
 
 if [ "$SKIP_CONFIG_CREATION" = false ]; then
     echo "==> Step 2b: Detecting install disk from VM configuration..."
@@ -1033,6 +1029,18 @@ echo -e "\n==> Step 7: Applying configurations to nodes..."
 
 cd "$VMS_DIR"
 
+# Ensure BRIDGE_NAME is set (may not be if --skip-terraform was used)
+if [ -z "${BRIDGE_NAME:-}" ]; then
+    set +o pipefail
+    BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
+    set -o pipefail
+    if [ -z "$BRIDGE_NAME" ]; then
+        echo "Error: No bridge interface found for arp-scan. Please create one and try again."
+        exit 1
+    fi
+    echo "Detected bridge interface: $BRIDGE_NAME"
+fi
+
 # Discovery parameters
 RETRY_COUNT=0
 MAX_RETRIES=24  # 24 * 5s = 2 minutes max wait
@@ -1048,7 +1056,7 @@ while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
   # Run the discovery command
   DISCOVERED_IPS=$(join -1 1 -2 1 -o 1.2,2.2 \
       <(terraform output -json | jq -r '.node_macs.value | to_entries[] | "\(.value | ascii_downcase) \(.key)"' | sort -k1,1) \
-      <(sudo arp-scan --interface=br0 --localnet | awk '/:/ {print $2, $1}' | sort -k1,1))
+      <($SUDO arp-scan --interface="$BRIDGE_NAME" --localnet | awk '/:/ {print $2, $1}' | sort -k1,1))
 
   if [ -n "$DISCOVERED_IPS" ]; then
       # If we have IPs and at least one responds, we're good
@@ -1080,7 +1088,7 @@ if [ -z "$DYNAMIC_IPS" ]; then
   virsh list --all
   echo "-------------------"
   echo "arp-scan raw output:"
-  sudo arp-scan --interface=br0 --localnet
+  $SUDO arp-scan --interface="$BRIDGE_NAME" --localnet
   echo "-------------------"
   exit 1
 fi
@@ -1202,20 +1210,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
 talosctl config endpoint $CONTROL_STATIC_IPS
 
-FIRST_READY=""
-for ip in $CONTROL_STATIC_IPS; do
-    if poll_until "Checking control node $ip" 180 2 talosctl -n "$ip" version --client=false; then
-        FIRST_READY="$ip"
-        break
-    fi
-done
-
-if [ -z "$FIRST_READY" ]; then
-    echo "⚠ No control nodes ready after 180s — check node status manually."
-    exit 1
-fi
-
-echo "✓ Control plane is ready. Workers will join after bootstrap."
+FIRST_READY="$FIRST_CP_STATIC_IP"
+echo "Using first control node: $FIRST_READY"
 
 # Close the skip-bootstrap conditional that started at Step 2
 else
@@ -1241,17 +1237,17 @@ fi
 if [ "$SKIP_BOOTSTRAP" = false ]; then
     echo -e "\n==> Step 8: Bootstrapping Kubernetes cluster..."
 
-    echo "Bootstrapping on first ready node: ${FIRST_CP_STATIC_IP}"
+    echo "Bootstrapping on: ${FIRST_READY}"
+    poll_until "Waiting to bootstrap" 300 10 talosctl -n "${FIRST_READY}" bootstrap \
+        && echo "✓ Bootstrap accepted" \
+        || echo "⚠ Bootstrap returned non-zero — may already be bootstrapped, continuing..."
 
-    if poll_until "Bootstrapping cluster" 45 15 talosctl -n "$FIRST_CP_STATIC_IP" bootstrap; then
-        echo "Verifying etcd cluster health..."
-        sleep 10
-        talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null | grep -q "Running" \
-            && echo "✓ Etcd is running and healthy" \
-            || echo "⚠ Warning: Could not verify etcd status (may still be starting)"
+    echo "Waiting for etcd to come up..."
+    if poll_until "Waiting for etcd" 180 10 \
+            talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null; then
+        echo "✓ Etcd is running and healthy"
     else
-        echo "✗ Bootstrap failed — cluster may already be bootstrapped or there is a critical issue."
-        echo "  Try manually: talosctl -n $FIRST_CP_STATIC_IP bootstrap"
+        echo "⚠ Warning: Could not verify etcd status after 180s (may still be starting)"
     fi
 else
     echo -e "\n==> Step 8: Skipping bootstrap as requested."
@@ -1322,7 +1318,7 @@ fi
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo -e "\n==> Step 9: Retrieving kubeconfig..."
-  cd $pwd
+  cd "$SCRIPT_DIR"
 
   echo "Waiting for Kubernetes API to be ready..."
 
@@ -1358,10 +1354,12 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
       CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
       CLI_ARCH=amd64
       if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+      cd /tmp
       curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
       sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
       $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
       rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+      cd "$SCRIPT_DIR"
       echo "✓ Cilium CLI installed"
   fi
 
@@ -1465,7 +1463,7 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
   echo ""
   echo "✓ ArgoCD installed successfully!"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "📋 ArgoCD Access Information:"
+  echo "=> ArgoCD Access Information:"
   echo "   • Username: admin"
   if [ -n "$ARGOCD_PASSWORD" ]; then
       echo "   • Password: $ARGOCD_PASSWORD"
@@ -1478,7 +1476,7 @@ if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
   echo ""
   
   # Optional: Apply deployment.yml if it exists
-  if [ -f "${pwd}/argocd/deployment.yml" ]; then
+  if [ -f "$SCRIPT_DIR/argocd/deployment.yml" ]; then
       echo "Found argocd/deployment.yml - would you like to apply it? (requires GitHub credentials)"
       echo "This will set up the ArgoCD Application for GitOps."
       echo "Note: You'll need to create the GitHub secret manually first."
@@ -1501,18 +1499,18 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   # Wait for the cluster to be ready
   echo "Waiting for cluster to be ready..."
   if kubectl wait --for=condition=Ready nodes --all --timeout=300s; then
-    echo "✅ All nodes are Ready."
+    echo "✓ All nodes are Ready."
   else
-    echo "⚠️ Timed out waiting for all nodes to be Ready. Continuing, but some components may fail."
+    echo "⚠ Timed out waiting for all nodes to be Ready. Continuing, but some components may fail."
   fi
 
   # Check for kubectl installation
   echo "Checking if kubectl is installed..."
   if ! command -v kubectl &> /dev/null; then
     echo "kubectl not found, installing..."
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    $SUDO install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-    rm kubectl
+    curl -Lo /tmp/kubectl "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    $SUDO install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+    rm /tmp/kubectl
   else
     echo "kubectl is already installed."
   fi
@@ -1531,15 +1529,15 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
   
   kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - \
-    || { echo "❌ Failed to create/update cloudflare-token secret."; exit 1; }
+    || { echo "✗ Failed to create/update cloudflare-token secret."; exit 1; }
 
   kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f - \
-    || { echo "❌ Failed to create/update pihole secret."; exit 1; }
+    || { echo "✗ Failed to create/update pihole secret."; exit 1; }
 
   # Check for FluxCD CLI
   if ! command -v flux &> /dev/null; then
     echo "Installing FluxCD CLI..."
-    curl -s https://fluxcd.io/install.sh | sudo bash
+    curl -s https://fluxcd.io/install.sh | $SUDO bash
   else
     echo "FluxCD CLI already installed."
   fi
@@ -1556,7 +1554,7 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     --path=clusters \
     --personal \
     --private=true || {
-      echo "❌ Flux bootstrap command failed. Check repository access and controller logs."
+      echo "✗ Flux bootstrap command failed. Check repository access and controller logs."
       echo "   Debug with: kubectl -n flux-system logs -l app=source-controller"
       exit 1
     }
@@ -1575,7 +1573,7 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     STATUS=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
     
     if [[ "$STATUS" == "True" ]]; then
-      echo "✅ Flux GitRepository is reconciled and ready."
+      echo "✓ Flux GitRepository is reconciled and ready."
       break
     else
       MESSAGE=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "GitRepository status not yet available.")
@@ -1589,7 +1587,7 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 
   # If the loop completes and the status is still not ready, fail gracefully.
   if [[ "$STATUS" != "True" ]]; then
-    echo "❌ GitRepository failed to become Ready after bootstrap and $RETRIES attempts."
+    echo "✗ GitRepository failed to become Ready after bootstrap and $RETRIES attempts."
     echo "   Please investigate the source-controller logs for errors:"
     echo "   kubectl -n flux-system logs -l app=source-controller"
     exit 1
@@ -1632,7 +1630,7 @@ if [ "$SKIP_INIT_OPENBAO" = false ]; then
   HELMRELEASE_NAMESPACE="flux-system"
   OUTPUT_FILE="openbao-credentials.txt"
   
-  cd $pwd
+  cd "$SCRIPT_DIR"
 
   info "Starting OpenBao initialization process..."
 
@@ -1664,9 +1662,9 @@ fi
 print_summary() {
 # --- Final Summary ---
 
-echo -e "\n✅ Cluster setup complete!"
+echo -e "\n✓ Cluster setup complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📋 Cluster Summary:"
+echo "=> Cluster Summary:"
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo "   • Control nodes: ${CONTROL_NODE_COUNT:-unknown}"
   echo "   • Worker nodes: ${WORKER_NODE_COUNT:-unknown}"
@@ -1682,7 +1680,7 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   echo "   • GitOps: FluxCD Setup (GitHub repo: $GITHUB_REPO_OWNER/$GITHUB_REPO)"
 fi
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-  echo "   • Kubeconfig Location: $(pwd)/kubeconfig"
+  echo "   • Kubeconfig Location: $SCRIPT_DIR/kubeconfig"
 fi
 if [ "$SKIP_INIT_OPENBAO" = false ]; then
   echo "   • OpenBao: Initialized with auto-unseal (see openbao-credentials.txt)"
@@ -1711,6 +1709,17 @@ CLEANUP_ON_ERROR=false
 # --- main ---
 main() {
     phase_preflight
+
+    # --- Cluster Topology (read after yq is guaranteed to be installed) ---
+    HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
+    set +o pipefail
+    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+    set -o pipefail
+    CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
+    CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
+    WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
+    K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
+
     phase_download_images
     phase_create_vms
     phase_generate_configs
