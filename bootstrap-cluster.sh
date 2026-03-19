@@ -739,6 +739,8 @@ credentials_prompt
 # Auto-detect running cluster — set SKIP_* flags if cluster already exists
 if [ "$SKIP_BOOTSTRAP" = false ] && [ -f "$CLUSTER_DIR/talosconfig" ] && \
    kubectl get nodes &>/dev/null 2>&1; then
+    export TALOSCONFIG="$CLUSTER_DIR/talosconfig"
+    export KUBECONFIG="${HOME}/.kube/config"
     echo "==> Existing cluster detected — skipping ISO download, VM creation, config generation and bootstrap."
     SKIP_ISO_DOWNLOAD=true
     SKIP_TERRAFORM=true
