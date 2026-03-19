@@ -746,6 +746,11 @@ if [ "$SKIP_BOOTSTRAP" = false ] && [ "$SKIP_TERRAFORM" = false ] && [ "$SKIP_CO
         SKIP_TERRAFORM=true
         SKIP_CONFIG_CREATION=true
         SKIP_BOOTSTRAP=true
+        # Check if Cilium is already installed
+        if TALOSCONFIG="$CLUSTER_DIR/talosconfig" kubectl get ns cilium &>/dev/null 2>&1; then
+            echo "==> Cilium already installed — skipping."
+            SKIP_CILIUM_INSTALLATION=true
+        fi
     fi
 fi
 
