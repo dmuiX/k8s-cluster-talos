@@ -389,6 +389,6 @@ Check `spec.valuesFrom` references, chart version compatibility, and whether dep
 
 ---
 
-> Built with [Claude Code](https://claude.ai/claude-code)
+> AI-assisted development with [Claude Code](https://claude.ai/claude-code)
 
-Tested on Functionality: Works ;)
+Tested on Functionality: Works for now ;) until they change anything with talos or the rest. 
