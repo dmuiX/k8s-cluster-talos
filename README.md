@@ -4,6 +4,21 @@ Fully automated Talos Linux Kubernetes cluster on KVM/libvirt — one script, ze
 
 Terraform provisioning → Cilium CNI → FluxCD GitOps → Cloudflare DNS → Longhorn storage → OpenBao secrets
 
+## 🤔 Why Talos? Why a single bash script?
+ 
+This cluster is the result of multiple failed attempts at on-prem Kubernetes:
+ 
+1. **Multipass + MicroK8s** (Ubuntu) — VMs were unreliable, DNS and hostname handling was a pain
+2. **Vagrant** — overly complex, dual IPs and hostname management made it frustrating
+3. **Ansible + KVM** — way too much manual plumbing to get right
+4. **Oracle Cloud free tier** — free VMs were never actually available
+ 
+**Why Talos?**
+Talos is an immutable, API-driven OS built specifically for Kubernetes — no SSH, no package manager, no drift. It brings everything out of the box: etcd, kubelet, containerd, all pre-configured. Upgrades are a single `talosctl upgrade` command — no apt, no reboots into broken states. Compared to provisioning Ubuntu/Debian nodes and manually bootstrapping Kubernetes on top, Talos removes an entire layer of complexity.
+ 
+**Why one bash script instead of Ansible?**
+Ansible adds abstraction that gets in the way when you're bootstrapping a cluster from scratch. You end up writing playbooks that shell out to `talosctl` and `terraform` anyway — at that point, just use bash directly. One script, linear flow, easy to debug with `bash -x`. The script auto-detects what's already done and skips completed phases, so it's idempotent without the Ansible overhead.
+
 ## 🧱 Stack
 
 | Component               | Version              | Role                                      |
