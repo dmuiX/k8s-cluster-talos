@@ -45,9 +45,8 @@
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
 # --- Versions ---
-CILIUM_VERSION="1.18.2"
-ARGOCD_VERSION="v3.0.19"
-GATEWAY_API_VERSION="v1.3.0"
+CILIUM_VERSION="1.19.2"
+GATEWAY_API_VERSION="v1.4.0"
 
 # --- Help Function ---
 show_help() {
@@ -1612,7 +1611,7 @@ phase_install_fluxcd() {
 if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 
   echo -e "\n==> Step 12: Installing FluxCD ..."
-  
+
   # Wait for the cluster to be ready
   echo "Waiting for cluster to be ready..."
   if kubectl wait --for=condition=Ready nodes --all --timeout=300s; then
@@ -1640,16 +1639,39 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   : "${GITHUB_REPO_OWNER:?Error: GITHUB_REPO_OWNER is not set.}"
   : "${GITHUB_REPO:?Error: GITHUB_REPO is not set.}"
 
-  # Create necessary namespaces and secrets
-  echo "Creating namespaces and secrets..."
+  # Create necessary namespaces
+  echo ""
+  echo "Creating namespaces..."
   kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
-  
-  kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - \
-    || { echo "✗ Failed to create/update cloudflare-token secret."; exit 1; }
 
-  kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f - \
+  # Create/update secrets
+  echo ""
+  echo "Creating secrets..."
+
+  local cf_result
+  cf_result=$(kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - 2>&1) \
+    || { echo "✗ Failed to create/update cloudflare-token secret."; exit 1; }
+  echo "  ✓ Secret cert-manager/cloudflare-token: $cf_result"
+
+  local pihole_result
+  pihole_result=$(kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f - 2>&1) \
     || { echo "✗ Failed to create/update pihole secret."; exit 1; }
+  echo "  ✓ Secret external-dns/pihole: $pihole_result"
+
+  # Restart external-dns pods to pick up secret values (if deployment exists)
+  echo ""
+  if kubectl get deployment -n external-dns --no-headers 2>/dev/null | grep -q .; then
+    echo "Restarting external-dns pods to pick up secret values..."
+    kubectl rollout restart deployment -n external-dns
+    kubectl rollout status deployment -n external-dns --timeout=60s 2>/dev/null || true
+
+    echo ""
+    echo "External-DNS pod status:"
+    kubectl get pods -n external-dns
+  else
+    echo "ⓘ No external-dns deployment found yet (will be deployed by FluxCD)"
+  fi
 
   # Check for FluxCD CLI
   if ! command -v flux &> /dev/null; then
