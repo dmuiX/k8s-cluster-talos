@@ -367,6 +367,7 @@ EOF
         # Export variables for yq to use in YAML generation
         # envsubst will replace string placeholders like ${NODE_NAME}.
         export SCHEMATIC_ID="$schematic_id"
+        export TALOS_VERSION="$TALOS_VERSION"
         export NODE_NAME="$name"
         export IP="$ip"
         export GATEWAY="$gateway"
@@ -802,7 +803,7 @@ done
 # Set defaults for download paths/URLs if not set by .env
 METALISO_ABSOLUTE_PATH="${METALISO_ABSOLUTE_PATH:-$VMS_DIR/metal-amd64.iso}"
 TALOS_CHECKSUM_URL="${TALOS_CHECKSUM_URL:-https://github.com/siderolabs/talos/releases/latest/download/sha256sum.txt}"
-UBUNTU_IMAGE_PATH="${UBUNTU_IMAGE_PATH:-/var/lib/libvirt/images/ubuntu-noble-cloudimg-amd64.img}"
+UBUNTU_IMAGE_PATH="${UBUNTU_IMAGE_PATH:-/var/lib/libvirt/images/resolute-server-cloudimg-amd64.img}"
 UBUNTU_CHECKSUM_URL="${UBUNTU_CHECKSUM_URL:-}"
 
 # Control plane scheduling — can be overridden in .env

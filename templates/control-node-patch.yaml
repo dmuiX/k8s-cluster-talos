@@ -1,6 +1,6 @@
 machine:
   install:
-    image: factory.talos.dev/installer/${SCHEMATIC_ID}:v1.11.2
+    image: factory.talos.dev/installer/${SCHEMATIC_ID}:${TALOS_VERSION}
   network:
     hostname: ${NODE_NAME}
     interfaces:
