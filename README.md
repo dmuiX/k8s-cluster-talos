@@ -114,8 +114,16 @@ GATEWAY="192.168.1.1"
 NAMESERVERS="192.168.1.253,192.168.1.1"
 
 # Download URLs
-TALOS_ISO_URL=https://...
-UBUNTU_IMAGE_URL=https://cloud-images.ubuntu.com/daily/server/noble/20260307/noble-server-cloudimg-amd64.img
+# TALOS
+TALOS_ISO_URL="https://github.com/siderolabs/talos/releases/latest/download/metal-amd64.iso"
+TALOS_CHECKSUM_URL="https://github.com/siderolabs/talos/releases/latest/download/sha256sum.txt"
+TALOS_VERSION="1.12.6"
+METALISO_ABSOLUTE_PATH="${VMS_DIR}/metal-amd64.iso"
+# Ubuntu
+UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/resolute/20260328/resolute-server-cloudimg-amd64.img"
+UBUNTU_CHECKSUM_URL="https://cloud-images.ubuntu.com/resolute/20260328/SHA256SUMS"
+UBUNTU_IMAGE_PATH="/var/lib/libvirt/images/resolute-server-cloudimg-amd64.img"
+
 
 # Terraform / Cloudflare (optional with --skip-cloudflare)
 TF_VAR_cloudflare_api_token=...
@@ -258,7 +266,8 @@ When deploying via ArgoCD, install in this order:
 
 ## 🐛 Troubleshooting
 
-Most cluster issues fall into a few categories: 
+Most cluster issues fall into a few categories:
+
 1. **pods not scheduling** (resources / taints / affinity)
 2. **pods crashing** (config / deps / OOM)
 3. **traffic not arriving** (routes / services / DNS)
@@ -284,6 +293,7 @@ kubectl describe pod <pod-name>       # check for OOMKilled in "Last State"
 ```
 
 Common causes:
+
 1. missing env vars or config
 2. OOM kill
 3. dependency not ready

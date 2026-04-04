@@ -7,6 +7,7 @@ resource "libvirt_cloudinit_disk" "haproxy_cloudinit_disk" {
     username      = var.haproxy_username,
     user_password = var.haproxy_password,
     github_owner  = var.github_owner
+    hostname      = each.value.name
   })
   network_config = templatefile("${path.module}/haproxy_network_config.tpl", {
     ip_address  = each.value.ip

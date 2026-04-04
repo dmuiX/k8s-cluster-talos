@@ -2,6 +2,7 @@ version: 2
 ethernets:
   ens3: # This assumes the interface is named ens3
     dhcp4: no
+    optional: false
     addresses:
       - ${ip_address}/24
     nameservers:

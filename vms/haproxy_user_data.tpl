@@ -2,6 +2,7 @@
 package_update: true
 package_upgrade: true
 reboot_if_required: true
+hostname: ${hostname}
 
 growpart:
   mode: auto
@@ -58,6 +59,7 @@ write_files:
           %{ endfor ~}
 
   - path: /etc/apt/apt.conf.d/50unattended-upgrades
+    permissions: "0644"
     content: |
       Unattended-Upgrade::Allowed-Origins {
         "$${distro_id}:$${distro_codename}";
@@ -75,6 +77,7 @@ write_files:
       Unattended-Upgrade::MailOnlyOnError "true";
 
   - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: "0644"
     content: |
       APT::Periodic::Update-Package-Lists "1";
       APT::Periodic::Download-Upgradeable-Packages "1";
@@ -112,8 +115,8 @@ runcmd:
   - systemctl enable haproxy
   - systemctl start haproxy
 
-    # Reboot to make the system restart required message go away
-  - reboot now
+  # Activate qemu-agent
+  - systemctl enable --now qemu-guest-agent
 
 users:
   - default
@@ -121,3 +124,8 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     groups: sudo
+
+power_state:
+  mode: reboot
+  message: "cloud-init finished, rebooting"
+  condition: true
