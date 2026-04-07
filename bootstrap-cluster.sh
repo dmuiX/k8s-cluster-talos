@@ -512,7 +512,7 @@ initialize_bao() {
       kubectl wait --for=condition=ready "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
 
   wait_with_spinner "Waiting for openbao-0 pod to be Running..." \
-      kubectl -n openbao wait --for=condition=Ready pod/openbao-0 --timeout=5m
+      kubectl -n openbao wait --for=jsonpath='{.status.containerStatuses[0].state.running}' pod/openbao-0 --timeout=5m
 
   info "Checking OpenBao initialization status via HTTP API..."
   # Using wget against the local API avoids the bao status exit-code issue.
@@ -1450,7 +1450,7 @@ if [ "$SKIP_INIT_OPENBAO" = false ]; then
   info "Starting OpenBao initialization process..."
 
   ensure_cli_tools_installed
-  ensure_flux_dependencies_ready
+  ensure_flux_dependencies_ready # openbao-0 muss running sein aber nicht ready
 
   create_unseal_secret
   initialize_bao
