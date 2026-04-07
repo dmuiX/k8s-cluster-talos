@@ -129,11 +129,13 @@ GATEWAY="192.168.1.1"
 NAMESERVERS="192.168.1.253,192.168.1.1"
 
 # Download URLs
+
 # TALOS
-TALOS_ISO_URL="https://github.com/siderolabs/talos/releases/latest/download/metal-amd64.iso"
-TALOS_CHECKSUM_URL="https://github.com/siderolabs/talos/releases/latest/download/sha256sum.txt"
 TALOS_VERSION="1.12.6"
+TALOS_ISO_URL="https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/metal-amd64.iso"
+TALOS_CHECKSUM_URL="https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/sha256sum.txt"
 METALISO_ABSOLUTE_PATH="${VMS_DIR}/metal-amd64.iso"
+
 # Ubuntu
 UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/resolute/20260328/resolute-server-cloudimg-amd64.img"
 UBUNTU_CHECKSUM_URL="https://cloud-images.ubuntu.com/resolute/20260328/SHA256SUMS"
