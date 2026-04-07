@@ -400,19 +400,19 @@ apply_config_with_retry() {
   local config_file=$3
   local max_attempts=3
   local attempt=1
-  
+
   while [ $attempt -le $max_attempts ]; do
     # Apply config WITH --mode=reboot so Talos handles the reboot properly
-    if talosctl -n "$node_ip" apply-config --insecure --file "$config_file" --mode=reboot 2>&1 | grep -q "applied"; then
+    if talosctl -n "$node_ip" apply-config --insecure --file "$config_file" --mode=reboot; then
       return 0
     fi
-    
+
     attempt=$((attempt + 1))
     if [ $attempt -le $max_attempts ]; then
       sleep 5
     fi
   done
-  
+
   return 1
 }
 
@@ -555,43 +555,77 @@ get_config_from_helmrelease() {
   fi
 }
 create_unseal_secret() {
-  info "Generating static key and creating secret '${SECRET_NAME}' in '${NAMESPACE}'..."
-  openssl rand 32 | kubectl create secret generic "${SECRET_NAME}" \
-      --namespace="${NAMESPACE}" \
-      --from-file="${SECRET_KEY_NAME}=/dev/stdin" \
+  # Generates a base64-encoded 32-byte random key and stores it as a K8s secret.
+  # This key is used by the OpenBao seal "static" config for auto-unseal.
+  # The key is printed to the terminal — back it up in a password manager immediately.
+  # Without this key the cluster cannot auto-unseal after a restart.
+  #
+  # NOTE: double base64 encoding is expected and correct.
+  # openssl rand -base64 32 produces a base64 string.
+  # --from-literal stores it as-is; Kubernetes then base64-encodes it internally.
+  # When reading back: kubectl get secret -o json | jq -r '.data."unseal-key"' | base64 -d
+  #   → gives back the original base64 string. That is the correct key value.
+  # NOTE: jq key has a hyphen — must be quoted: jq -r '.data."unseal-key"' (not .data.unseal-key)
+  info "Generating static unseal key and creating secret 'openbao-unseal-key' in namespace 'openbao'..."
+
+  local static_key
+  static_key=$(openssl rand -base64 32)
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  UNSEAL KEY (back this up now!): $static_key"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  # Ensure namespace exists — Flux may not have created it yet if the HelmRelease
+  # is still waiting for this secret to exist before it can reconcile.
+  kubectl create namespace openbao --dry-run=client -o yaml | kubectl apply -f -
+
+  # Must exist BEFORE OpenBao starts — Flux will reconcile once the secret is present.
+  kubectl create secret generic openbao-unseal-key \
+      -n openbao \
+      --from-literal=unseal-key="${static_key}" \
       --dry-run=client -o yaml | kubectl apply -f -
-  success "Secret created. Flux will now reconcile the release."
+
+  success "Secret created. Flux will now reconcile the HelmRelease."
 }
+
 initialize_bao() {
-  wait_with_spinner "Waiting for HelmRelease to become ready after secret creation..." \
+  # Waits for the openbao-0 pod to be running, checks if already initialized,
+  # and if not runs 'bao operator init' with 1 recovery share.
+  # Output (root token + recovery key) is saved to openbao-credentials.txt.
+  #
+  # Uses the HTTP API to check init status instead of 'bao status' — because
+  # 'bao status' exits with code 2 when sealed, which would abort the script
+  # under set -euo pipefail even though the output is valid.
+
+  wait_with_spinner "Waiting for HelmRelease 'openbao' to become ready..." \
       kubectl wait --for=condition=ready "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
 
-  local pod_selector="app.kubernetes.io/name=openbao"
-  wait_with_spinner "Waiting for an OpenBao pod to become ready..." \
-      kubectl -n "${NAMESPACE}" wait --for=jsonpath='{.status.phase}'=Running pod -l "${pod_selector}" --timeout=5m
+  wait_with_spinner "Waiting for openbao-0 pod to be Running..." \
+      kubectl -n openbao wait --for=condition=Ready pod/openbao-0 --timeout=5m
 
-  local pod_name
-  pod_name=$(kubectl get pods -n "${NAMESPACE}" -l "${pod_selector}" -o jsonpath='{.items[0].metadata.name}')
-  success "Found pod '${pod_name}' to perform initialization."
-
+  info "Checking OpenBao initialization status via HTTP API..."
+  # Using wget against the local API avoids the bao status exit-code issue.
   local init_status
-  init_status=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
-  wget -qO- http://127.0.0.1:8200/v1/sys/init 2>/dev/null | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
+  init_status=$(kubectl exec -n openbao openbao-0 -- \
+      wget -qO- http://127.0.0.1:8200/v1/sys/init 2>/dev/null \
+      | grep -o '"initialized":[^,}]*' | cut -d':' -f2)
 
-  info "Checking OpenBao initialization status on pod '${pod_name}'..."
   if [[ "$init_status" == "true" ]]; then
       success "OpenBao is already initialized. No action needed."
   else
-      info "OpenBao is not initialized. Running 'bao operator init' with recovery keys..."
+      info "OpenBao is not initialized. Running 'bao operator init'..."
       local init_output
-      init_output=$(kubectl -n "${NAMESPACE}" exec "${pod_name}" \
-      -- bao operator init \
-      -recovery-shares=5 \
-      -recovery-threshold=3 2>&1)
+      init_output=$(kubectl exec -n openbao openbao-0 -- bao operator init \
+          -recovery-shares=1 \
+          -recovery-threshold=1 2>&1)
+
       echo -e "\n--- [ OpenBao Initialization Output ] ---\n${init_output}\n-----------------------------------------"
       echo "${init_output}" > "${OUTPUT_FILE}"
+
       success "Initialization complete. Credentials saved to '${OUTPUT_FILE}'."
-      info "IMPORTANT: The file '${OUTPUT_FILE}' contains your root token and recovery keys. Secure it immediately."
+      info "IMPORTANT: Back up '${OUTPUT_FILE}' — it contains your root token and recovery key."
   fi
 }
 
@@ -1302,18 +1336,71 @@ while read -r name dyn_ip; do
     continue
   fi
 
-  echo "Setting boot order for: $name"
-  # Shutdown VM, wait until off, update boot order, restart
-  $SUDO virsh shutdown "$name" 2>/dev/null || true
-  # Wait until VM is actually off
-  while $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
-    sleep 2
+  echo "Setting boot order for: $name ($dyn_ip)"
+
+  # --- TIMING CHECK (not a boot-order or static-IP verify) ---
+  # This only detects WHEN it's safe to change the boot order.
+  # It does NOT verify that the boot order is correct afterwards.
+  # Static IP reachability is verified later in Phase 7.3.
+  #
+  # After apply-config --mode=reboot, the VM goes through two reboots:
+  #   Reboot 1: VM shuts down ISO environment → boots ISO again
+  #   Installer: Talos installs itself to disk (DHCP IP still active, Talos API responds)
+  #   Reboot 2: Installation done → VM shuts down installer → post-install reboot
+  #
+  # We detect Reboot 2 via the dynamic (DHCP) IP becoming unreachable.
+  # At that moment the VM is guaranteed to be mid-reboot → safe to force-off
+  # and update the persistent boot order before libvirt auto-restarts it.
+
+  install_waited=0
+
+  # Step a: Wait for node to come back on DHCP IP after Reboot 1 (installer is running)
+  # NOTE: polls --insecure (no cert) because static IP/certs don't exist yet at this stage
+  echo -n "  Waiting for $name to boot into installer"
+  until timeout 3 talosctl -n "$dyn_ip" version --insecure &>/dev/null \
+      || [ $install_waited -ge 120 ]; do
+    sleep 3; install_waited=$((install_waited + 3)); echo -n "."
   done
+  echo ""
+
+  # Step b: Wait for DHCP IP to go unreachable (Reboot 2 — post-install reboot started)
+  # This is the signal that installation finished and the VM is shutting down.
+  echo -n "  Waiting for $name to complete installation"
+  until ! timeout 3 talosctl -n "$dyn_ip" version --insecure &>/dev/null \
+      || [ $install_waited -ge 300 ]; do
+    sleep 3; install_waited=$((install_waited + 3)); echo -n "."
+  done
+  echo " (${install_waited}s)"
+
+  # Force off via virsh destroy — needed because libvirt may auto-restart the VM
+  # on guest-triggered reboots (on_reboot=restart is the default).
+  # virsh destroy puts the VM into a clean "shut off" state, which is the only
+  # state where virt-xml --edit takes effect for the next boot.
+  $SUDO virsh destroy "$name" 2>/dev/null || true
+
+  # Update persistent boot order while VM is definitely off.
+  # virt-xml --edit only changes the persistent XML (not the live config),
+  # so the VM must be off for this to take effect on next start.
   if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
-    echo "  ✓ Boot order updated for $name (disk->cdrom)"
+    echo "  ✓ Boot order updated for $name (disk first, cdrom fallback)"
   else
     echo "  ⚠ Warning: Failed to update boot order for $name"
   fi
+
+  # Verify the persistent XML actually has disk (hd) as first boot device.
+  # This catches cases where virt-xml silently failed or wrote the wrong order.
+  local first_boot
+  first_boot=$($SUDO virsh dumpxml "$name" 2>/dev/null \
+      | grep '<boot dev=' | head -1 \
+      | grep -o "dev='[^']*'" | cut -d"'" -f2)
+  if [ "$first_boot" = "hd" ]; then
+    echo "  ✓ Verified: persistent boot order is disk-first (hd)"
+  else
+    echo "  ⚠ Warning: first boot device is '${first_boot:-unknown}', expected 'hd' — VM may boot from ISO again"
+  fi
+
+  # Start VM — now boots from disk using the static IP config applied in Phase 7.1.
+  # Static IP reachability is verified in Phase 7.3.
   $SUDO virsh start "$name"
 done < <(echo "$ALL_NODE_IPS")
 
@@ -1335,8 +1422,45 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
 talosctl config endpoint $CONTROL_STATIC_IPS
 
-FIRST_READY="$FIRST_CP_STATIC_IP"
-echo "Using first control node: $FIRST_READY"
+FIRST_READY=""
+MAX_WAIT=180 # 3min — extra time after boot order change + VM restart
+ELAPSED=0
+
+# --- STATIC IP REACHABILITY CHECK ---
+# This is the actual verification that the VM booted from disk with the correct config.
+# Polls the STATIC IP (from nodes.yaml) using --client=false (authenticated, with certs).
+# Only succeeds once Talos is running from disk with the new config applied.
+# This is NOT the same as the DHCP IP polling in Phase 7.2 (which used --insecure).
+echo "Checking for first ready control node..."
+while [ -z "$FIRST_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
+  for ip in $CONTROL_STATIC_IPS; do
+    if talosctl -n "$ip" version --client=false &>/dev/null; then
+      FIRST_READY="$ip"
+      echo ""
+      echo "✓ First control node ready: $ip (${ELAPSED}s)"
+      break
+    fi
+  done
+
+  if [ -z "$FIRST_READY" ]; then
+    if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+      echo -n " [${ELAPSED}s]"
+    else
+      echo -n "."
+    fi
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+  fi
+done
+
+if [ -z "$FIRST_READY" ]; then
+  echo ""
+  echo "⚠ Warning: No control nodes ready after ${MAX_WAIT}s"
+  echo "Cannot proceed with bootstrap. Check node status manually."
+  exit 1
+fi
+
+echo "✓ Control plane is ready. Workers will join after bootstrap."
 
 # Close the skip-bootstrap conditional that started at Step 2
 else
@@ -1772,14 +1896,10 @@ fi
 
 phase_init_openbao() {
 if [ "$SKIP_INIT_OPENBAO" = false ]; then
-  # A fully dynamic and robust script to initialize an auto-unsealing OpenBao cluster,
-  # featuring a corrected, safe spinner and conditional execution block.
-
-  # --- User-Configurable Variables ---
   HELMRELEASE_NAME="openbao"
   HELMRELEASE_NAMESPACE="flux-system"
   OUTPUT_FILE="openbao-credentials.txt"
-  
+
   cd "$SCRIPT_DIR"
 
   info "Starting OpenBao initialization process..."
@@ -1787,22 +1907,10 @@ if [ "$SKIP_INIT_OPENBAO" = false ]; then
   ensure_cli_tools_installed
   ensure_flux_dependencies_ready
 
-  get_config_from_helmrelease
-  
-  cat <<-EOF
-
---- Configuration Discovered ---
-Target Namespace: ${NAMESPACE}
-Secret Name     : ${SECRET_NAME}
-Secret Key Name : ${SECRET_KEY_NAME}
---------------------------------
-
-EOF
-    
   create_unseal_secret
   initialize_bao
-    
-  success "✓ Openbao Cluster sucessfully initialized. Will unseal automatically from now on."
+
+  success "OpenBao cluster initialized. Will auto-unseal from now on."
 else
   echo -e "\n==> Skipping OpenBao initialization as requested."
 fi
