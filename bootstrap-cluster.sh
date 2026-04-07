@@ -107,42 +107,28 @@ CLEANUP_ON_ERROR=true  # Can be set to false with --no-cleanup flag
 
 cleanup_on_error() {
     local exit_code=$?
-    if [ $exit_code -ne 0 ] && [ "$CLEANUP_ON_ERROR" = true ]; then
-        echo ""
-        echo "========================================"
-        echo "ERROR: Script failed with exit code $exit_code"
-        echo "========================================"
-        echo -e "\n⚠ The script encountered an error."
-        echo -e "\nDo you want to clean up the infrastructure? (VMs will be destroyed)"
-        read -p "Type 'yes' to destroy VMs and cleanup, or 'no' to keep them: " -r
-        echo
-        
-        if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-            echo "Skipping cleanup. VMs and configs are preserved."
-            echo "To manually cleanup later, run: ./bootstrap-cluster.sh --cleanup-all"
-            return
-        fi
-        
-        echo -e "==> Cleaning up infrastructure..."
-        
-        if [ -n "${VMS_DIR:-}" ] && [ -d "$VMS_DIR" ]; then
-            echo "Running terraform destroy to clean up VMs..."
-            cleanup_vms_only
-            echo "✓ VMs destroyed"
-        else
-            echo "Warning: Could not locate VMS_DIR for cleanup."
-        fi
-        
-        # Clean up cluster directory (remove all generated configs)
-        if [ -n "${CLUSTER_DIR:-}" ] && [ -d "$CLUSTER_DIR" ]; then
-            echo "Cleaning up cluster configuration files..."
-            cd "$CLUSTER_DIR"
-            rm -rf ./node-configs 2>/dev/null
-            rm -f ./*-patched.yaml ./talosconfig 2>/dev/null
-            echo "✓ Cluster configs removed (kept: secrets.yaml)"
-        fi
-        
-        echo "Cleanup complete. You can re-run the script to try again."
+    [ $exit_code -eq 0 ] || [ "$CLEANUP_ON_ERROR" != true ] && return
+
+    warn "Script failed with exit code $exit_code"
+    read -p "Destroy VMs and cleanup? (yes/no): " -r
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        info "Skipping cleanup. Run './bootstrap-cluster.sh --cleanup-all' to clean up later."
+        return
+    fi
+
+    info "Cleaning up infrastructure"
+    if [ -n "${VMS_DIR:-}" ] && [ -d "$VMS_DIR" ]; then
+        cleanup_vms_only
+        success "VMs destroyed"
+    else
+        warn "Could not locate VMS_DIR for cleanup."
+    fi
+
+    if [ -n "${CLUSTER_DIR:-}" ] && [ -d "$CLUSTER_DIR" ]; then
+        cd "$CLUSTER_DIR"
+        rm -rf ./node-configs 2>/dev/null
+        rm -f ./*-patched.yaml ./talosconfig 2>/dev/null
+        success "Cluster configs removed (kept: secrets.yaml)"
     fi
 }
 
@@ -658,10 +644,8 @@ credentials_prompt() {
     done
     [ "$need" = false ] && return 0
 
-    echo ""
-    echo "==> Missing required configuration — please enter values below."
+    info "Missing required configuration — please enter values below."
     echo "    (Tip: save these in a .env file to skip this prompt next time)"
-    echo ""
 
     _ask() {
         local var="$1" prompt="$2" default="$3"
@@ -677,7 +661,6 @@ credentials_prompt() {
     _ask TALOS_ISO_URL            "Talos ISO URL"             ""
     _ask UBUNTU_IMAGE_URL         "Ubuntu cloud image URL"    ""
     [ "${SKIP_CLOUDFLARE:-false}" = false ] && _ask TF_VAR_cloudflare_api_token "Cloudflare API token"  ""
-    echo ""
 }
 
 # --- Initialization ---
@@ -1695,44 +1678,18 @@ fi
 
 
 print_summary() {
-# --- Final Summary ---
-
-echo -e "\n✓ Cluster setup complete!"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "=> Cluster Summary:"
+success "Cluster setup complete"
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo "   • Control nodes: ${CONTROL_NODE_COUNT:-unknown}"
   echo "   • Worker nodes: ${WORKER_NODE_COUNT:-unknown}"
   echo "   • Kubernetes endpoint: ${K8S_ENDPOINT}"
+  echo "   • Kubeconfig: $SCRIPT_DIR/kubeconfig"
 fi
-if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
-  echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
-fi
-if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
-  echo "   • GitOps: ArgoCD (HA mode)"
-fi
-if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
-  echo "   • GitOps: FluxCD Setup (GitHub repo: $GITHUB_REPO_OWNER/$GITHUB_REPO)"
-fi
-if [ "$SKIP_BOOTSTRAP" = false ]; then
-  echo "   • Kubeconfig Location: $SCRIPT_DIR/kubeconfig"
-fi
-if [ "$SKIP_INIT_OPENBAO" = false ]; then
-  echo "   • OpenBao: Initialized with auto-unseal (see openbao-credentials.txt)"
-fi
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "To verify your cluster, run:"
-if [ "$SKIP_BOOTSTRAP" = false ]; then
-    echo "  kubectl get nodes"
-fi
-if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
-    echo "  cilium status"
-fi
-if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
-    echo "  kubectl get pods -n argocd"
-fi
-echo "k get pods -A"
+[ "$SKIP_CILIUM_INSTALLATION" = false ] && echo "   • CNI: Cilium with KubePrism (127.0.0.1:7445)"
+[ "$SKIP_ARGOCD_INSTALLATION" = false ] && echo "   • GitOps: ArgoCD (HA mode)"
+[ "$SKIP_FLUXCD_INSTALLATION" = false ] && echo "   • GitOps: FluxCD ($GITHUB_REPO_OWNER/$GITHUB_REPO)"
+[ "$SKIP_INIT_OPENBAO" = false ] && echo "   • OpenBao: initialized (see openbao-credentials.txt)"
+echo "Verify with: kubectl get pods -A"
 
 # --- Disable cleanup trap on successful completion ---
 # Script completed successfully, so disable the error cleanup trap
