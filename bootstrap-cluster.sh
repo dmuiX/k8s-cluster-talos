@@ -912,7 +912,7 @@ phase_download_images() {
 if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
     cd "${VMS_DIR}"
     
-    echo "==> Downloading standard Talos ISO..."
+    info "Downloading images"
     download_and_verify \
         "Talos metal ISO" \
         "$TALOS_ISO_URL" \
@@ -933,7 +933,7 @@ if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
         "false"
 
 else
-    echo "Skipping iso-download as requested."
+    debug "Skipping iso-download as requested."
 fi
 }
 
@@ -952,42 +952,35 @@ if [ "$SKIP_TERRAFORM" = false ]; then
     BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
     set -o pipefail
     if [ -z "$BRIDGE_NAME" ]; then
-        echo "No bridge interface found. Please create one and try again."
-        exit 1
+        error "No bridge interface found. Please create one and try again."
     fi
 
     cd "${VMS_DIR}"
-    
-    echo "Found bridge interface: $BRIDGE_NAME"
+
+    debug "Found bridge interface: $BRIDGE_NAME"
     export TF_VAR_bridge_name=$BRIDGE_NAME
 
-    # Initialize and apply Terraform cloudflare configuration
-    echo "Initializing and applying Terraform Cloudflare configuration."
-    
+    info "Applying Terraform configuration"
     terraform init -input=false
     if [ "$SKIP_CLOUDFLARE" = true ]; then
-        echo "Skipping Cloudflare DNS records as requested."
+        debug "Skipping Cloudflare DNS records as requested."
         export TF_VAR_enable_cloudflare=false
     fi
     if ! terraform apply; then
-        echo "Terraform apply failed."
-        echo "cleaning up created VMs..."
+        warn "Terraform apply failed — cleaning up created VMs..."
         terraform destroy
         exit 1
     fi
-    
+
     # Verify VMs were actually created
-    echo "Verifying VMs were created..."
     EXPECTED_NODES=$(yq e '.nodes[] | .name' "$NODES_FILE_PATH" | wc -l)
     CREATED_VMS=$($SUDO virsh list --all | grep -E "control-node|worker-node|haproxy" | wc -l)
-    
+
     if [ "$CREATED_VMS" -ne "$EXPECTED_NODES" ]; then
-        echo "WARNING: Expected $EXPECTED_NODES VMs but found $CREATED_VMS. Some VMs may not have been created."
+        warn "Expected $EXPECTED_NODES VMs but found $CREATED_VMS. Some VMs may not have been created."
     else
-        echo "✓ All $CREATED_VMS VMs created successfully."
+        success "All $CREATED_VMS VMs created."
     fi
-    
-    echo "Terraform applied successfully."
 fi
 }
 
@@ -1003,7 +996,7 @@ phase_preflight() {
 
 # Create cluster directory if it doesn't exist
 if [ ! -d "$CLUSTER_DIR" ]; then
-    echo "Cluster directory '$CLUSTER_DIR' does not exist. Creating it."
+    debug "Cluster directory '$CLUSTER_DIR' does not exist. Creating it."
     mkdir -p "$CLUSTER_DIR"
 fi
 
@@ -1011,12 +1004,11 @@ cd "${CLUSTER_DIR}"
 
 # Check if talosctl is installed, if not, install it
 if ! command -v talosctl &> /dev/null; then
-    echo "Installing talosctl..."
+    info "Installing talosctl"
     curl -sL https://talos.dev/install | $SUDO sh
 fi
-# --- Main Script Execution ---
 
-echo "==> Step 2a: Performing pre-flight checks..."
+info "Step 2a: Performing pre-flight checks"
 
 # Install required command-line tools if not already present
 # - yq: YAML processor for reading nodes.yaml
@@ -1181,14 +1173,11 @@ echo -e "\n==> Continuing with node installation and bootstrap..."
 #   4. Apply machine configs to dynamic IPs with --mode=reboot
 #   5. Nodes reboot and boot from disk with static IPs configured
 
-echo -e "\n==> Step 6: Verifying HAProxy is ready..."
-
-echo "Checking HAProxy at ${HAPROXY_IP}:6443..."
+info "Step 6: Verifying HAProxy at ${HAPROXY_IP}:6443"
 
 if ! poll_until "Waiting for HAProxy on port 6443" 360 10 \
         bash -c "nc -z -w 5 \"$HAPROXY_IP\" 6443 || echo > /dev/tcp/${HAPROXY_IP}/6443"; then
-    echo "⚠ Warning: HAProxy not responding after 6 minutes — continuing anyway"
-    echo "  Check HAProxy logs: ssh lb_user@${HAPROXY_IP}"
+    warn "HAProxy not responding after 6 minutes — continuing anyway (check: ssh lb_user@${HAPROXY_IP})"
 fi
 
 echo -e "\n==> Step 7: Applying configurations to nodes..."
@@ -1202,10 +1191,9 @@ if [ -z "${BRIDGE_NAME:-}" ]; then
     BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
     set -o pipefail
     if [ -z "$BRIDGE_NAME" ]; then
-        echo "Error: No bridge interface found for arp-scan. Please create one and try again."
-        exit 1
+        error "No bridge interface found for arp-scan. Please create one and try again."
     fi
-    echo "Detected bridge interface: $BRIDGE_NAME"
+    debug "Detected bridge interface: $BRIDGE_NAME"
 fi
 
 # Discovery parameters
@@ -1216,8 +1204,7 @@ DYNAMIC_IPS=""
 EXPECTED_NODE_COUNT=$(yq e '[.nodes[] | select(.role != "haproxy")] | length' "$NODES_FILE_PATH")
 
 # Discover nodes by matching MAC addresses (from Terraform) to IPs (from arp-scan)
-echo "Discovering node IPs with arp-scan..."
-echo "Looking for ${EXPECTED_NODE_COUNT} Talos nodes with DHCP-assigned IPs..."
+info "Discovering ${EXPECTED_NODE_COUNT} Talos nodes via arp-scan"
 
 while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
   # Run the discovery command
@@ -1236,24 +1223,17 @@ while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
 
   RETRY_COUNT=$((RETRY_COUNT + 1))
   if [ $((RETRY_COUNT % 4)) -eq 0 ]; then
-      echo "  [${RETRY_COUNT}×${RETRY_DELAY}s] Still waiting for nodes to boot..."
-  else
-      echo -n "."
+      debug "[${RETRY_COUNT}×${RETRY_DELAY}s] Still waiting for nodes to boot..."
   fi
   sleep $RETRY_DELAY
 done
 
-if [ $((RETRY_COUNT % 4)) -ne 0 ] && [ $RETRY_COUNT -gt 0 ]; then
-  echo ""
-fi
-
 # Fail if no nodes are found after all retries
 if [ -z "$DYNAMIC_IPS" ]; then
-  echo "Error: Failed to discover any node IPs with arp-scan after $((MAX_RETRIES * RETRY_DELAY))s." >&2
+  warn "Failed to discover any node IPs with arp-scan after $((MAX_RETRIES * RETRY_DELAY))s."
   echo "--- Diagnostics ---"
   echo "VM Status:"
   virsh list --all
-  echo "-------------------"
   echo "arp-scan raw output:"
   $SUDO arp-scan --interface="$BRIDGE_NAME" --localnet
   echo "-------------------"
@@ -1261,17 +1241,19 @@ if [ -z "$DYNAMIC_IPS" ]; then
 fi
 
 FOUND_COUNT=$(echo "$DYNAMIC_IPS" | wc -l)
-echo "✓ Successfully discovered ${FOUND_COUNT}/${EXPECTED_NODE_COUNT} nodes"
-echo "$DYNAMIC_IPS" | while read -r name ip; do
-  echo "  • $name → $ip"
-done
+success "Discovered ${FOUND_COUNT}/${EXPECTED_NODE_COUNT} nodes"
+if [ "${DEBUG:-false}" = true ]; then
+  echo "$DYNAMIC_IPS" | while read -r name ip; do
+    debug "$name → $ip"
+  done
+fi
 
 # Change back to cluster directory where the patched configs are located
 cd "$CLUSTER_DIR"
 
 # Export TALOSCONFIG for all subsequent talosctl commands
 export TALOSCONFIG="$CLUSTER_DIR/talosconfig"
-echo "Using talosconfig: $TALOSCONFIG"
+debug "Using talosconfig: $TALOSCONFIG"
 
 # Filter control and worker nodes from discovered IPs
 CONTROL_IPS=$(echo "$DYNAMIC_IPS" | grep '^control-node' || true)
