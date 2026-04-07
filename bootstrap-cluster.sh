@@ -1063,6 +1063,11 @@ if [ "$SKIP_CONFIG_CREATION" = false ]; then
         echo "  ✓ Generated machine configurations with install disk: $INSTALL_DISK"
     fi
 
+    # fix         * static hostname is already set in v1alpha1 config
+    # Remove HostnameConfig document - hostname is set per-node in patches
+    yq -i 'select(.kind != "HostnameConfig")' controlplane.yaml
+    [ -f worker.yaml ] && yq -i 'select(.kind != "HostnameConfig")' worker.yaml
+
     # Remove worker.yaml if no workers configured (talosctl always generates both)
     if [ "${WORKER_NODE_COUNT:-0}" -eq 0 ] && [ -f "worker.yaml" ]; then
         rm -f worker.yaml
@@ -1298,13 +1303,18 @@ while read -r name dyn_ip; do
   fi
 
   echo "Setting boot order for: $name"
-
-  # Use virt-xml to set boot order: disk first, cdrom second
+  # Shutdown VM, wait until off, update boot order, restart
+  $SUDO virsh shutdown "$name" 2>/dev/null || true
+  # Wait until VM is actually off
+  while $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
+    sleep 2
+  done
   if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
     echo "  ✓ Boot order updated for $name (disk->cdrom)"
   else
     echo "  ⚠ Warning: Failed to update boot order for $name"
   fi
+  $SUDO virsh start "$name"
 done < <(echo "$ALL_NODE_IPS")
 
 cd "$CLUSTER_DIR"
