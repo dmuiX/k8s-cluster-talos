@@ -151,6 +151,9 @@ UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/resolute/20260328/resolute-ser
 UBUNTU_CHECKSUM_URL="https://cloud-images.ubuntu.com/resolute/20260328/SHA256SUMS"
 UBUNTU_IMAGE_PATH="/var/lib/libvirt/images/resolute-server-cloudimg-amd64.img"
 
+# Cilium / Gateway API
+CILIUM_VERSION="1.19.2"
+GATEWAY_API_VERSION="v1.4.0"
 
 # Terraform / Cloudflare (optional with --skip-cloudflare)
 TF_VAR_cloudflare_api_token=...

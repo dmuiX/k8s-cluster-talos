@@ -4,9 +4,6 @@
 
 set -eu  # pipefail is debug-only (see --debug handling below).
 
-CILIUM_VERSION="1.19.2"
-GATEWAY_API_VERSION="v1.4.0"
-
 # --- Help Function ---
 show_help() {
     cat << EOF
@@ -793,15 +790,9 @@ fi
 
 
 phase_download_images() {
-# --- Step 0: Download Required Images (Talos ISO and Ubuntu Cloud Image) ---
-# Downloads and verifies:
-#   - Talos metal ISO for Kubernetes nodes
-#   - Ubuntu cloud image for HAProxy load balancer
-# Both downloads include SHA256 checksum verification
-
 if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
     cd "${VMS_DIR}"
-    
+
     info "Downloading images"
     download_and_verify \
         "Talos metal ISO" \
@@ -811,8 +802,7 @@ if [ "$SKIP_ISO_DOWNLOAD" = false ]; then
         "" \
         "false" \
         "true"
-    
-    # Download Ubuntu Cloud Image for HAProxy
+
     download_and_verify \
         "Ubuntu cloud image" \
         "$UBUNTU_IMAGE_URL" \
@@ -829,13 +819,6 @@ fi
 
 
 phase_create_vms() {
-# --- Step 1: Create VMs with Terraform ---
-# Uses Terraform to:
-#   - Create libvirt VMs for control plane and worker nodes
-#   - Create HAProxy load balancer VM
-#   - Configure Cloudflare DNS records
-#   - Attach Talos ISO to nodes for initial boot
-
 if [ "$SKIP_TERRAFORM" = false ]; then
     BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
     if [ -z "$BRIDGE_NAME" ]; then
@@ -859,7 +842,6 @@ if [ "$SKIP_TERRAFORM" = false ]; then
         exit 1
     fi
 
-    # Verify VMs were actually created
     EXPECTED_NODES=$(yq e '.nodes[] | .name' "$NODES_FILE_PATH" | wc -l)
     CREATED_VMS=$($SUDO virsh list --all | grep -E "control-node|worker-node|haproxy" | wc -l)
 
@@ -873,15 +855,6 @@ fi
 
 
 phase_preflight() {
-# --- Step 2: Setup and Pre-flight Checks ---
-# Prepare for cluster bootstrapping:
-#   - Install required tools (talosctl, yq, jq, arp-scan)
-#   - Create cluster directory
-#   - Extract configuration from Terraform output
-
-# talosctl configuration
-
-# Create cluster directory if it doesn't exist
 if [ ! -d "$CLUSTER_DIR" ]; then
     debug "Cluster directory '$CLUSTER_DIR' does not exist. Creating it."
     mkdir -p "$CLUSTER_DIR"
@@ -889,7 +862,6 @@ fi
 
 cd "${CLUSTER_DIR}"
 
-# Check if talosctl is installed, if not, install it
 if ! command -v talosctl &> /dev/null; then
     info "Installing talosctl"
     curl -sL https://talos.dev/install | $SUDO sh
@@ -897,15 +869,6 @@ fi
 
 info "Step 2a: Performing pre-flight checks"
 
-# Install required command-line tools if not already present
-# - yq: YAML processor for reading nodes.yaml
-# - jq: JSON processor for parsing Terraform output
-# - curl: HTTP client for downloads
-# - arp-scan: Network scanner for discovering node IPs
-# - genisoimage/mkisofs: Required by terraform-provider-libvirt for cloud-init ISO creation
-# - openssl: Used for generating secrets
-# - terraform: Infrastructure provisioning
-# - helm: Kubernetes package manager (used by Cilium install)
 missing_pkgs=()
 command -v yq       &>/dev/null || missing_pkgs+=(yq)
 command -v jq       &>/dev/null || missing_pkgs+=(jq)
@@ -936,13 +899,6 @@ fi
 
 
 phase_generate_configs() {
-# --- Step 3: Generate Talos Secrets and Machine Configurations ---
-# Generate:
-#   - Secrets bundle (certificates, tokens, keys)
-#   - Base machine configs for control plane and workers
-#   - Configure Kubernetes API endpoint (HAProxy IP)
-# Only run if NOT skipping config creation
-
 cd "$CLUSTER_DIR"
 
 if [ "$SKIP_CONFIG_CREATION" = false ]; then
@@ -1008,20 +964,6 @@ else
     INSTALL_DISK="/dev/vda"  # Default, won't be used for generation
 fi
 
-# --- Step 4: Wait for VMs to Boot from ISO ---
-# At this point:
-#   - VMs have been created by Terraform with ISO attached
-#   - Nodes are booting from the Talos ISO (live environment)
-#   - Network interfaces will get DHCP IPs from the router
-#   - Static IPs are NOT configured yet (they're in the machine config)
-#
-# Generate machine configs for each node with:
-#   - Static IP addresses
-#   - Hostname
-#   - Network configuration
-#   - Node-specific patches
-# These configs will be applied to nodes running on DHCP IPs
-
 info "Step 4-5: Generating node-specific configurations"
 cd "$CLUSTER_DIR"
 mkdir -p ./node-configs
@@ -1031,7 +973,6 @@ if [ "$SKIP_CONFIG_CREATION" = true ]; then
 else
     debug "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
 
-    # Use the new helper function to create patch files.
     generate_patch_files_by_role "control-node"
     if [ "$WORKER_NODE_COUNT" -gt 0 ]; then
         generate_patch_files_by_role "worker-node"
@@ -1041,20 +982,9 @@ fi
 
 
 phase_bootstrap() {
-# --- Steps 6-9: Bootstrap Process ---
-# Only run if NOT skipping bootstrap
-
 if [ "$SKIP_BOOTSTRAP" = false ]; then
 
 echo -e "\n==> Continuing with node installation and bootstrap..."
-
-# --- Step 6: Discover Dynamic IPs and Apply Configurations ---
-# Workflow:
-#   1. Discover nodes via arp-scan (they have DHCP IPs now)
-#   2. Match MAC addresses from Terraform to discovered IPs
-#   3. Eject ISO from all nodes
-#   4. Apply machine configs to dynamic IPs with --mode=reboot
-#   5. Nodes reboot and boot from disk with static IPs configured
 
 info "Step 6: Verifying HAProxy at ${HAPROXY_IP}:6443"
 
@@ -1068,7 +998,6 @@ echo -e "\n==> Step 7: Applying configurations to nodes..."
 
 cd "$VMS_DIR"
 
-# Ensure BRIDGE_NAME is set (may not be if --skip-terraform was used)
 if [ -z "${BRIDGE_NAME:-}" ]; then
     BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
     if [ -z "$BRIDGE_NAME" ]; then
@@ -1077,24 +1006,20 @@ if [ -z "${BRIDGE_NAME:-}" ]; then
     debug "Detected bridge interface: $BRIDGE_NAME"
 fi
 
-# Discovery parameters
 RETRY_COUNT=0
 MAX_RETRIES=24  # 24 * 5s = 2 minutes max wait
 RETRY_DELAY=5
 DYNAMIC_IPS=""
 EXPECTED_NODE_COUNT=$(yq e '[.nodes[] | select(.role != "haproxy")] | length' "$NODES_FILE_PATH")
 
-# Discover nodes by matching MAC addresses (from Terraform) to IPs (from arp-scan)
 info "Discovering ${EXPECTED_NODE_COUNT} Talos nodes via arp-scan"
 
 while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-  # Run the discovery command
   DISCOVERED_IPS=$(join -1 1 -2 1 -o 1.2,2.2 \
       <(terraform output -json | jq -r '.node_macs.value | to_entries[] | "\(.value | ascii_downcase) \(.key)"' | sort -k1,1) \
       <($SUDO arp-scan --interface="$BRIDGE_NAME" --localnet | awk '/:/ {print $2, $1}' | sort -k1,1))
 
   if [ -n "$DISCOVERED_IPS" ]; then
-      # If we have IPs and at least one responds, we're good
       FOUND_COUNT=$(echo "$DISCOVERED_IPS" | wc -l)
       if [ "$FOUND_COUNT" -ge "$EXPECTED_NODE_COUNT" ]; then
           DYNAMIC_IPS="$DISCOVERED_IPS"
@@ -1109,7 +1034,6 @@ while [ -z "$DYNAMIC_IPS" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
   sleep $RETRY_DELAY
 done
 
-# Fail if no nodes are found after all retries
 if [ -z "$DYNAMIC_IPS" ]; then
   warn "Failed to discover any node IPs with arp-scan after $((MAX_RETRIES * RETRY_DELAY))s."
   echo "--- Diagnostics ---"
@@ -1129,25 +1053,16 @@ if [ "${DEBUG:-false}" = true ]; then
   done
 fi
 
-# Change back to cluster directory where the patched configs are located
 cd "$CLUSTER_DIR"
 
-# Export TALOSCONFIG for all subsequent talosctl commands
 export TALOSCONFIG="$CLUSTER_DIR/talosconfig"
 debug "Using talosconfig: $TALOSCONFIG"
 
-# Filter control and worker nodes from discovered IPs
 CONTROL_IPS=$(echo "$DYNAMIC_IPS" | grep '^control-node' || true)
 WORKER_IPS=$(echo "$DYNAMIC_IPS" | grep '^worker-node' || true)
 
-# --- Step 7: Install ALL nodes in parallel (control + workers) ---
-# Apply configurations to all nodes simultaneously for faster installation
-# Then wait only for first control node to be ready before bootstrapping
-# Workers will join the cluster automatically after bootstrap completes
-
 info "Step 7: Installing Talos on all nodes (parallel)"
 
-# Combine all node IPs for parallel installation
 if [ -n "$WORKER_IPS" ]; then
     ALL_NODE_IPS=$(printf "%s\n%s" "$CONTROL_IPS" "$WORKER_IPS")
 else
@@ -1176,7 +1091,6 @@ while read -r name dyn_ip; do
   NODE_NUMBER=$((NODE_NUMBER + 1))
 done < <(echo "$ALL_NODE_IPS")
 
-# Wait for all background jobs and check exit codes
 failed=()
 for pid in "${!job_pids[@]}"; do
   if ! wait "$pid"; then
@@ -1184,7 +1098,6 @@ for pid in "${!job_pids[@]}"; do
   fi
 done
 
-# Check for failures
 if [ ${#failed[@]} -gt 0 ]; then
   FAILED_NODES="${failed[*]}"
   warn "Some nodes failed to apply config: $FAILED_NODES — continuing with remaining nodes..."
@@ -1214,13 +1127,6 @@ while read -r name _; do
   fi
 done < <(echo "$ALL_NODE_IPS")
 cd "$CLUSTER_DIR"
-
-# (Old Phase 7.2 removed — see commit history. The old wait-for-two-reboots +
-#  destroy + start dance was defending against an install failure caused by
-#  a missing v-prefix on the factory image tag, fixed in d3415a8. With the
-#  install actually succeeding, Talos kexecs into the installed system and
-#  Phase 7.2 had nothing to do except flip the persistent boot order — which
-#  is now the one line above.)
 
 info "Phase 7.2: Waiting for first control node"
 debug "talosctl endpoints: $CONTROL_STATIC_IPS"
@@ -1252,7 +1158,6 @@ if [ -z "$FIRST_READY" ]; then
   error "No control nodes ready after ${MAX_WAIT}s — check node status manually."
 fi
 
-# Close the skip-bootstrap conditional that started at Step 2
 else
     info "Steps 2-7: Skipped (--skip-bootstrap enabled)"
     cd "${CLUSTER_DIR}"
@@ -1260,12 +1165,6 @@ else
     export TALOSCONFIG="$CLUSTER_DIR/talosconfig"
     debug "Using talosconfig: $TALOSCONFIG"
 fi
-
-# At this point, first control node is ready! Bootstrap immediately.
-
-# --- Step 8: Bootstrap Kubernetes Cluster ---
-# Initialize the Kubernetes cluster on the first control plane node
-# This creates the etcd cluster and starts Kubernetes components
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
     info "Step 8: Bootstrapping Kubernetes cluster on ${FIRST_READY}"
@@ -1283,9 +1182,6 @@ else
     info "Step 8: Skipping bootstrap as requested"
     FIRST_CP_STATIC_IP=$(get_ips_by_role control-node | head -1)
 fi
-
-# --- Step 8a: Wait for Remaining Control Nodes to Join ---
-# Now that bootstrap is complete, wait for other control nodes to join etcd
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
@@ -1326,7 +1222,6 @@ else
   info "Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
 fi
 
-# --- Step 9: Retrieve Kubeconfig ---
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   info "Step 9: Retrieving kubeconfig"
   cd "$SCRIPT_DIR"
@@ -1343,10 +1238,6 @@ fi
 
 
 phase_install_cilium() {
-# --- Step 10: Install Cilium CNI with KubePrism ---
-# Install Cilium using Talos's built-in KubePrism load balancer
-# This avoids certificate issues and provides optimal performance
-
 if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
   info "Step 10: Installing Cilium CNI with KubePrism"
 
@@ -1463,7 +1354,6 @@ fi
 
 
 phase_install_fluxcd() {
-# --- 12: Install FluxCD ---
 if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 
   info "Step 12: Installing FluxCD"
@@ -1521,7 +1411,6 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     --private=true \
     || error "Flux bootstrap failed (check: kubectl -n flux-system logs -l app=source-controller)"
 
-  # Post-bootstrap verification that GitRepository becomes Ready
   RETRIES=10
   SLEEP_INTERVAL=30
   COUNTER=0
@@ -1550,8 +1439,6 @@ fi
 
 
 phase_cleanup_temp() {
-# --- Cleanup temporary files ---
-
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   debug "Cleaning up node-configs/"
   cd "$CLUSTER_DIR"
