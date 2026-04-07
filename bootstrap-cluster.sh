@@ -488,13 +488,26 @@ ensure_cli_tools_installed() {
   success "All required tools are present."
 }
 ensure_flux_dependencies_ready() {
-    # wait for 20 seconds to allow initial reconciliation
-    sleep 20
+    info "Reconciling Flux before waiting for HelmReleases..."
+    flux reconcile source git flux-system --timeout=5m || true
+    flux reconcile kustomization flux-system --with-source --timeout=5m || true
+
     info "Ensuring OpenBao's Flux dependencies are ready..."
     local dependencies=("cilium" "cert-manager" "longhorn")
-    
+
     for dep in "${dependencies[@]}"; do
-        echo "==> Waiting for $dep HelmRelease..."
+        echo "==> Waiting for $dep HelmRelease to be created..."
+        for i in {1..60}; do
+            if kubectl get helmrelease "$dep" -n "${HELMRELEASE_NAMESPACE}" &>/dev/null; then
+                break
+            fi
+            if [[ $i -eq 60 ]]; then
+                error "HelmRelease '$dep' was not created in ${HELMRELEASE_NAMESPACE} within 5 minutes."
+            fi
+            sleep 5
+        done
+
+        echo "==> Waiting for $dep HelmRelease to be Ready..."
         kubectl wait --for=condition=Ready "helmrelease/$dep" \
             -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
 
