@@ -1331,25 +1331,58 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 cd "$VMS_DIR"
 
-# Process ALL nodes (both control and worker)
+# Process ALL nodes in parallel — each node is independent
+declare -A phase72_pids
 while read -r name dyn_ip; do
   if [ -z "$name" ]; then
     continue
   fi
 
-  echo "Setting boot order for: $name"
-  # Shutdown VM, wait until off, update boot order, restart
-  $SUDO virsh shutdown "$name" 2>/dev/null || true
-  while $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
-    sleep 2
-  done
-  if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
-    echo "  ✓ Boot order updated for $name (disk->cdrom)"
-  else
-    echo "  ⚠ Warning: Failed to update boot order for $name"
-  fi
-  $SUDO virsh start "$name"
+  (
+    echo "Setting boot order for: $name"
+    # Wait for Talos to finish installing (it stops responding when it reboots).
+    # If we shut down the VM before installation is done, the disk write is
+    # interrupted and the node boots into maintenance mode on the next start.
+    echo -n "  [$name] Waiting for installation to finish..."
+    INSTALL_WAIT=0
+    while [ $INSTALL_WAIT -lt 120 ]; do
+      if ! talosctl -n "$dyn_ip" version --insecure &>/dev/null; then
+        echo " done (${INSTALL_WAIT}s)"
+        break
+      fi
+      sleep 3
+      INSTALL_WAIT=$((INSTALL_WAIT + 3))
+    done
+    if [ $INSTALL_WAIT -ge 120 ]; then
+      echo " (timeout — continuing anyway)"
+    fi
+
+    # Shutdown VM, wait until off, update boot order, restart
+    $SUDO virsh shutdown "$name" 2>/dev/null || true
+    SHUTDOWN_WAIT=0
+    while $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
+      sleep 2
+      SHUTDOWN_WAIT=$((SHUTDOWN_WAIT + 2))
+      if [ $SHUTDOWN_WAIT -ge 30 ]; then
+        $SUDO virsh destroy "$name" 2>/dev/null || true
+        break
+      fi
+    done
+    if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
+      echo "  [$name] ✓ Boot order updated (disk->cdrom)"
+    else
+      echo "  [$name] ⚠ Warning: Failed to update boot order"
+    fi
+    $SUDO virsh start "$name"
+    echo "  [$name] ✓ Started"
+  ) &
+  phase72_pids[$!]=$name
 done < <(echo "$ALL_NODE_IPS")
+
+# Wait for all nodes to finish
+for pid in "${!phase72_pids[@]}"; do
+  wait "$pid" || echo "⚠ Boot order update failed for ${phase72_pids[$pid]}"
+done
 
 cd "$CLUSTER_DIR"
 
@@ -1440,7 +1473,7 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
 
     echo "Waiting for etcd to come up..."
     if poll_until "Waiting for etcd" 180 10 \
-            talosctl -n "$FIRST_CP_STATIC_IP" service etcd status 2>/dev/null; then
+            talosctl -n "$FIRST_READY" service etcd status 2>/dev/null; then
         echo "✓ Etcd is running and healthy"
     else
         echo "⚠ Warning: Could not verify etcd status after 180s (may still be starting)"
@@ -1462,7 +1495,7 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
       echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
       
       echo "Waiting for all ${CONTROL_NODE_COUNT} control nodes to join etcd..."
-      READY_NODES="$FIRST_CP_STATIC_IP"
+      READY_NODES="$FIRST_READY"
       for ip in $CONTROL_STATIC_IPS; do
           echo "$READY_NODES" | grep -q "$ip" && continue
           if poll_until "  Waiting for control node $ip" 90 2 talosctl -n "$ip" version --client=false; then
@@ -1519,8 +1552,8 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
   echo "Waiting for Kubernetes API to be ready..."
 
   if ! poll_until "Waiting for kubeconfig" 200 10 \
-          talosctl -n "$FIRST_CP_STATIC_IP" kubeconfig --force; then
-      echo "✗ Failed to retrieve kubeconfig after 200s — try manually: talosctl -n $FIRST_CP_STATIC_IP kubeconfig"
+          talosctl -n "$FIRST_READY" kubeconfig --force; then
+      echo "✗ Failed to retrieve kubeconfig after 200s — try manually: talosctl -n $FIRST_READY kubeconfig"
   fi
   export KUBECONFIG="${HOME}/.kube/config"
 else
