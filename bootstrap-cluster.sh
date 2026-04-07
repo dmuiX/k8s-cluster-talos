@@ -1337,71 +1337,17 @@ while read -r name dyn_ip; do
     continue
   fi
 
-  echo "Setting boot order for: $name ($dyn_ip)"
-
-  # --- TIMING CHECK (not a boot-order or static-IP verify) ---
-  # This only detects WHEN it's safe to change the boot order.
-  # It does NOT verify that the boot order is correct afterwards.
-  # Static IP reachability is verified later in Phase 7.3.
-  #
-  # After apply-config --mode=reboot, the VM goes through two reboots:
-  #   Reboot 1: VM shuts down ISO environment → boots ISO again
-  #   Installer: Talos installs itself to disk (DHCP IP still active, Talos API responds)
-  #   Reboot 2: Installation done → VM shuts down installer → post-install reboot
-  #
-  # We detect Reboot 2 via the dynamic (DHCP) IP becoming unreachable.
-  # At that moment the VM is guaranteed to be mid-reboot → safe to force-off
-  # and update the persistent boot order before libvirt auto-restarts it.
-
-  install_waited=0
-
-  # Step a: Wait for node to come back on DHCP IP after Reboot 1 (installer is running)
-  # NOTE: polls --insecure (no cert) because static IP/certs don't exist yet at this stage
-  echo -n "  Waiting for $name to boot into installer"
-  until timeout 3 talosctl -n "$dyn_ip" version --insecure &>/dev/null \
-      || [ $install_waited -ge 120 ]; do
-    sleep 3; install_waited=$((install_waited + 3)); echo -n "."
+  echo "Setting boot order for: $name"
+  # Shutdown VM, wait until off, update boot order, restart
+  $SUDO virsh shutdown "$name" 2>/dev/null || true
+  while $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
+    sleep 2
   done
-  echo ""
-
-  # Step b: Wait for DHCP IP to go unreachable (Reboot 2 — post-install reboot started)
-  # This is the signal that installation finished and the VM is shutting down.
-  echo -n "  Waiting for $name to complete installation"
-  until ! timeout 3 talosctl -n "$dyn_ip" version --insecure &>/dev/null \
-      || [ $install_waited -ge 300 ]; do
-    sleep 3; install_waited=$((install_waited + 3)); echo -n "."
-  done
-  echo " (${install_waited}s)"
-
-  # Force off via virsh destroy — needed because libvirt may auto-restart the VM
-  # on guest-triggered reboots (on_reboot=restart is the default).
-  # virsh destroy puts the VM into a clean "shut off" state, which is the only
-  # state where virt-xml --edit takes effect for the next boot.
-  $SUDO virsh destroy "$name" 2>/dev/null || true
-
-  # Update persistent boot order while VM is definitely off.
-  # virt-xml --edit only changes the persistent XML (not the live config),
-  # so the VM must be off for this to take effect on next start.
   if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
-    echo "  ✓ Boot order updated for $name (disk first, cdrom fallback)"
+    echo "  ✓ Boot order updated for $name (disk->cdrom)"
   else
     echo "  ⚠ Warning: Failed to update boot order for $name"
   fi
-
-  # Verify the persistent XML actually has disk (hd) as first boot device.
-  # This catches cases where virt-xml silently failed or wrote the wrong order.
-  local first_boot
-  first_boot=$($SUDO virsh dumpxml "$name" 2>/dev/null \
-      | grep '<boot dev=' | head -1 \
-      | grep -o "dev='[^']*'" | cut -d"'" -f2)
-  if [ "$first_boot" = "hd" ]; then
-    echo "  ✓ Verified: persistent boot order is disk-first (hd)"
-  else
-    echo "  ⚠ Warning: first boot device is '${first_boot:-unknown}', expected 'hd' — VM may boot from ISO again"
-  fi
-
-  # Start VM — now boots from disk using the static IP config applied in Phase 7.1.
-  # Static IP reachability is verified in Phase 7.3.
   $SUDO virsh start "$name"
 done < <(echo "$ALL_NODE_IPS")
 
