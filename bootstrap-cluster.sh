@@ -1709,8 +1709,6 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   # Verify required environment variables
   echo "Verifying required environment variables..."
   : "${CLOUDFLARE_API_TOKEN:?Error: CLOUDFLARE_API_TOKEN is not set.}"
-  : "${PIHOLE_PASSWORD:?Error: PIHOLE_PASSWORD is not set.}"
-  : "${PIHOLE_SERVER:?Error: PIHOLE_SERVER is not set.}"
   : "${GITHUB_REPO_OWNER:?Error: GITHUB_REPO_OWNER is not set.}"
   : "${GITHUB_REPO:?Error: GITHUB_REPO is not set.}"
 
@@ -1728,11 +1726,6 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   cf_result=$(kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - 2>&1) \
     || { echo "✗ Failed to create/update cloudflare-token secret."; exit 1; }
   echo "  ✓ Secret cert-manager/cloudflare-token: $cf_result"
-
-  local pihole_result
-  pihole_result=$(kubectl create secret generic pihole -n external-dns --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" --dry-run=client -o yaml | kubectl apply -f - 2>&1) \
-    || { echo "✗ Failed to create/update pihole secret."; exit 1; }
-  echo "  ✓ Secret external-dns/pihole: $pihole_result"
 
   # Restart external-dns pods to pick up secret values (if deployment exists)
   echo ""
