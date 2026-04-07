@@ -1459,19 +1459,14 @@ phase_install_cilium() {
 # This avoids certificate issues and provides optimal performance
 
 if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
-  echo -e "\n==> Step 10: Installing Cilium CNI with KubePrism..."
+  info "Step 10: Installing Cilium CNI with KubePrism"
 
-  # Wait for Kubernetes API to be fully ready
-  echo "Waiting for Kubernetes API to be fully ready..."
   if ! poll_until "Waiting for Kubernetes API" 600 10 kubectl get nodes; then
-      echo "⚠ Kubernetes API not ready after 10 minutes — cannot install Cilium"
-      echo "  Check: talosctl -n $FIRST_CP_STATIC_IP service kubelet status"
-      exit 1
+      error "Kubernetes API not ready after 10 minutes (check: talosctl -n $FIRST_CP_STATIC_IP service kubelet status)"
   fi
 
-  # Check if cilium CLI is available
   if ! command -v cilium &> /dev/null; then
-      echo "Installing Cilium CLI..."
+      info "Installing Cilium CLI"
       CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
       CLI_ARCH=amd64
       if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
@@ -1481,37 +1476,26 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
       $SUDO tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
       rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
       cd "$SCRIPT_DIR"
-      echo "✓ Cilium CLI installed"
+      debug "Cilium CLI installed"
   fi
 
-  # Clean up any existing Cilium installation
-  echo "Checking for existing Cilium resources..."
+  # Cleanup block intentionally preserved — defends against half-installed re-run state.
+  # Do not remove without consulting feedback_cilium_cleanup memory.
+  debug "Checking for existing Cilium resources..."
   if kubectl get ns cilium &>/dev/null 2>&1; then
-      echo "Found existing Cilium, removing..."
-      
-      # Remove Helm release if it exists
+      debug "Found existing Cilium, removing..."
       helm uninstall cilium -n cilium --no-hooks 2>/dev/null || true
-      
-      # Force cleanup with cilium CLI (30s timeout)
-      timeout 30 cilium uninstall 2>/dev/null || echo "Cilium CLI cleanup completed"
-      
-      # Force delete namespaces
+      timeout 30 cilium uninstall 2>/dev/null || debug "Cilium CLI cleanup completed"
       kubectl delete ns cilium cilium-test --grace-period=0 --force 2>/dev/null || true
-      
-      echo "Cleanup complete, waiting 5s..."
       sleep 5
-  else
-      echo "No existing Cilium installation found."
   fi
-  
-  # Create cilium namespace with Helm labels and annotations (idempotent)
+
+  # Create cilium namespace with Helm labels/annotations (idempotent)
   kubectl create namespace cilium --dry-run=client -o yaml | kubectl apply -f -
   kubectl label namespace cilium app.kubernetes.io/managed-by=Helm --overwrite
   kubectl annotate namespace cilium meta.helm.sh/release-name=cilium meta.helm.sh/release-namespace=cilium --overwrite
 
-  # kubeprism! port 7445
-  # Install Cilium with KubePrism configuration
-  echo "Installing Cilium with KubePrism (127.0.0.1:7445)..."
+  info "Installing Cilium with KubePrism (127.0.0.1:7445)"
   cilium install \
       --version "$CILIUM_VERSION" \
       --namespace cilium \
@@ -1539,12 +1523,13 @@ if [ "$SKIP_CILIUM_INSTALLATION" = false ]; then
   if poll_until "Waiting for Cilium pods" 300 10 \
           bash -c "kubectl get pods -n cilium -l app.kubernetes.io/name=cilium-agent \
                    -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running"; then
-      cilium status 2>/dev/null || echo "  Note: Run 'cilium status' to verify installation"
+      [ "${DEBUG:-false}" = true ] && cilium status 2>/dev/null || true
+      success "Cilium installed"
   else
-      echo "⚠ Cilium may still be initializing — check: cilium status"
+      warn "Cilium may still be initializing — check: cilium status"
   fi
 else
-  echo -e "\n==> Step 10: Skipping Cilium installation as requested."
+  info "Step 10: Skipping Cilium installation"
 fi
 }
 
@@ -1555,58 +1540,35 @@ phase_install_argocd() {
 # Uses HA manifests and installs Gateway API CRDs
 
 if [ "$SKIP_ARGOCD_INSTALLATION" = false ]; then
-  echo -e "\n==> Step 11: Installing ArgoCD..."
-  
-  # Wait for cluster to be ready
-  echo "Waiting for cluster to be ready..."
-  kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || echo "⚠ Nodes may still be initializing"
-  
-  # Install ArgoCD namespace
+  info "Step 11: Installing ArgoCD (HA mode)"
+
+  kubectl wait --for=condition=Ready nodes --all --timeout=300s 2>/dev/null || warn "Nodes may still be initializing"
+
   kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-  
-  # Install ArgoCD HA components
-  echo "Installing ArgoCD (HA mode)..."
   kubectl -n argocd apply -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/ha/namespace-install.yaml"
   kubectl apply -n argocd -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/ha/install.yaml"
 
-  
-  # Install Gateway API CRDs
-  echo "Installing Gateway API CRDs..."
+  debug "Installing Gateway API CRDs"
   kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
-  
-  # Wait for ArgoCD server to be ready
-  echo "Waiting for ArgoCD server to be ready..."
-  kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s || echo "⚠ ArgoCD may still be starting"
-  
-  # Get initial admin password
+
+  kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s || warn "ArgoCD may still be starting"
+
   ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-  
-  echo ""
-  echo "✓ ArgoCD installed successfully!"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "=> ArgoCD Access Information:"
+
+  success "ArgoCD installed"
   echo "   • Username: admin"
   if [ -n "$ARGOCD_PASSWORD" ]; then
       echo "   • Password: $ARGOCD_PASSWORD"
   else
-      echo "   • Password: Run 'kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d'"
+      echo "   • Password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
   fi
   echo "   • Port-forward: kubectl port-forward svc/argocd-server -n argocd 8080:443"
-  echo "   • Access at: https://localhost:8080"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo ""
-  
-  # Optional: Apply deployment.yml if it exists
+
   if [ -f "$SCRIPT_DIR/argocd/deployment.yml" ]; then
-      echo "Found argocd/deployment.yml - would you like to apply it? (requires GitHub credentials)"
-      echo "This will set up the ArgoCD Application for GitOps."
-      echo "Note: You'll need to create the GitHub secret manually first."
-      echo ""
-      echo "To apply later, run:"
-      echo "  kubectl apply -f argocd/deployment.yml"
+      debug "Found argocd/deployment.yml — apply manually with 'kubectl apply -f argocd/deployment.yml' after creating GitHub secret."
   fi
 else
-  echo -e "\n==> Step 11: Skipping ArgoCD installation as requested."
+  info "Step 11: Skipping ArgoCD installation"
 fi
 }
 
@@ -1615,74 +1577,51 @@ phase_install_fluxcd() {
 # --- 12: Install FluxCD ---
 if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
 
-  echo -e "\n==> Step 12: Installing FluxCD ..."
+  info "Step 12: Installing FluxCD"
 
-  # Wait for the cluster to be ready
-  echo "Waiting for cluster to be ready..."
-  if kubectl wait --for=condition=Ready nodes --all --timeout=300s; then
-    echo "✓ All nodes are Ready."
-  else
-    echo "⚠ Timed out waiting for all nodes to be Ready. Continuing, but some components may fail."
-  fi
+  kubectl wait --for=condition=Ready nodes --all --timeout=300s \
+    || warn "Timed out waiting for all nodes to be Ready — some components may fail."
 
-  # Check for kubectl installation
-  echo "Checking if kubectl is installed..."
   if ! command -v kubectl &> /dev/null; then
-    echo "kubectl not found, installing..."
+    info "Installing kubectl"
     curl -Lo /tmp/kubectl "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
     $SUDO install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
     rm /tmp/kubectl
-  else
-    echo "kubectl is already installed."
   fi
 
-  # Verify required environment variables
-  echo "Verifying required environment variables..."
   : "${CLOUDFLARE_API_TOKEN:?Error: CLOUDFLARE_API_TOKEN is not set.}"
   : "${GITHUB_REPO_OWNER:?Error: GITHUB_REPO_OWNER is not set.}"
   : "${GITHUB_REPO:?Error: GITHUB_REPO is not set.}"
 
-  # Create necessary namespaces
-  echo ""
-  echo "Creating namespaces..."
   kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
 
-  # Create/update secrets
-  echo ""
-  echo "Creating secrets..."
+  kubectl create secret generic cloudflare-token -n cert-manager \
+    --from-literal=token="$CLOUDFLARE_API_TOKEN" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+    || error "Failed to create/update cloudflare-token secret."
 
-  local cf_result
-  cf_result=$(kubectl create secret generic cloudflare-token -n cert-manager --from-literal=token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - 2>&1) \
-    || { echo "✗ Failed to create/update cloudflare-token secret."; exit 1; }
-  echo "  ✓ Secret cert-manager/cloudflare-token: $cf_result"
+  kubectl create secret generic pihole -n external-dns \
+    --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" \
+    --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" \
+    --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+    || error "Failed to create/update pihole secret."
 
   # Restart external-dns pods to pick up secret values (if deployment exists)
   echo ""
   if kubectl get deployment -n external-dns --no-headers 2>/dev/null | grep -q .; then
-    echo "Restarting external-dns pods to pick up secret values..."
+    debug "Restarting external-dns pods to pick up secret values..."
     kubectl rollout restart deployment -n external-dns
     kubectl rollout status deployment -n external-dns --timeout=60s 2>/dev/null || true
-
-    echo ""
-    echo "External-DNS pod status:"
-    kubectl get pods -n external-dns
-  else
-    echo "ⓘ No external-dns deployment found yet (will be deployed by FluxCD)"
   fi
 
-  # Check for FluxCD CLI
   if ! command -v flux &> /dev/null; then
-    echo "Installing FluxCD CLI..."
+    info "Installing FluxCD CLI"
     curl -s https://fluxcd.io/install.sh | $SUDO bash
-  else
-    echo "FluxCD CLI already installed."
   fi
 
-  # --- CHANGE 1: Run `flux bootstrap` BEFORE checking for reconciliation ---
-  # The bootstrap command is idempotent and will create the GitRepository.
-  # This is the main fix for the "not found" error.
-  echo "--> Running Flux bootstrap..."
+  info "Running flux bootstrap"
   flux bootstrap github \
     --token-auth \
     --owner="$GITHUB_REPO_OWNER" \
@@ -1690,51 +1629,33 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     --branch=main \
     --path=clusters \
     --personal \
-    --private=true || {
-      echo "✗ Flux bootstrap command failed. Check repository access and controller logs."
-      echo "   Debug with: kubectl -n flux-system logs -l app=source-controller"
-      exit 1
-    }
+    --private=true \
+    || error "Flux bootstrap failed (check: kubectl -n flux-system logs -l app=source-controller)"
 
-  # --- CHANGE 2: Use the loop as a post-bootstrap VERIFICATION step ---
-  # Now that bootstrap has run, this loop confirms the system becomes healthy.
+  # Post-bootstrap verification that GitRepository becomes Ready
   RETRIES=10
   SLEEP_INTERVAL=30
   COUNTER=0
   STATUS=""
 
-  echo "--> Verifying Flux GitRepository reconciliation status after bootstrap..."
+  debug "Verifying Flux GitRepository reconciliation"
   while [[ $COUNTER -lt $RETRIES ]]; do
-    echo "    (Attempt $((COUNTER+1))/$RETRIES)..."
-    
     STATUS=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-    
     if [[ "$STATUS" == "True" ]]; then
-      echo "✓ Flux GitRepository is reconciled and ready."
       break
-    else
-      MESSAGE=$(kubectl -n flux-system get gitrepositories.source.toolkit.fluxcd.io flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "GitRepository status not yet available.")
-      echo "    Status: Not Ready. Waiting..."
-      echo "    Message: $MESSAGE"
     fi
-    
+    debug "  (Attempt $((COUNTER+1))/$RETRIES) Not ready yet..."
     ((COUNTER++))
     sleep $SLEEP_INTERVAL
   done
 
-  # If the loop completes and the status is still not ready, fail gracefully.
   if [[ "$STATUS" != "True" ]]; then
-    echo "✗ GitRepository failed to become Ready after bootstrap and $RETRIES attempts."
-    echo "   Please investigate the source-controller logs for errors:"
-    echo "   kubectl -n flux-system logs -l app=source-controller"
-    exit 1
+    error "GitRepository failed to become Ready after $RETRIES attempts (check: kubectl -n flux-system logs -l app=source-controller)"
   fi
-  
-  echo ""
-  echo " ✓ FluxCD repo ${GITHUB_REPO_OWNER}/${GITHUB_REPO} deployed and reconciled successfully!"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  success "FluxCD repo ${GITHUB_REPO_OWNER}/${GITHUB_REPO} deployed and reconciled"
 else
-    echo -e "\n==> Step 12: Skipping FluxCD installation as requested."
+    info "Step 12: Skipping FluxCD installation"
 fi
 }
 
@@ -1743,16 +1664,9 @@ phase_cleanup_temp() {
 # --- Cleanup temporary files ---
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-  echo -e "\n==> Cleaning up temporary files..."
+  debug "Cleaning up node-configs/"
   cd "$CLUSTER_DIR"
-
-  # Remove temporary directories
-  if [ -d "./node-configs" ]; then
-    rm -rf ./node-configs
-    echo "  ✓ Removed node-configs/"
-  fi
-
-  echo "  ✓ Kept: talosconfig, secrets.yaml, controlplane.yaml, worker.yaml and *-patched.yaml files"
+  [ -d "./node-configs" ] && rm -rf ./node-configs
 fi
 }
 
@@ -1775,7 +1689,7 @@ if [ "$SKIP_INIT_OPENBAO" = false ]; then
 
   success "OpenBao cluster initialized. Will auto-unseal from now on."
 else
-  echo -e "\n==> Skipping OpenBao initialization as requested."
+  info "Skipping OpenBao initialization"
 fi
 }
 
