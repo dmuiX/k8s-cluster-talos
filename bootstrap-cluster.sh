@@ -42,7 +42,7 @@
 #     --cleanup-all           Complete cleanup: VMs + DNS (terraform destroy)
 #
 
-set -euo pipefail  # Exit on error, undefined vars, pipe failures
+set -eu  # Exit on error, undefined vars. pipefail is debug-only (see --debug handling).
 
 # --- Versions ---
 CILIUM_VERSION="1.19.2"
@@ -617,7 +617,7 @@ initialize_bao() {
   #
   # Uses the HTTP API to check init status instead of 'bao status' — because
   # 'bao status' exits with code 2 when sealed, which would abort the script
-  # under set -euo pipefail even though the output is valid.
+  # under set -eu even though the output is valid.
 
   wait_with_spinner "Waiting for HelmRelease 'openbao' to become ready..." \
       kubectl wait --for=condition=ready "helmrelease/${HELMRELEASE_NAME}" -n "${HELMRELEASE_NAMESPACE}" --timeout=10m
@@ -895,8 +895,9 @@ if [ "$SKIP_BOOTSTRAP" = false ] && [ -f "$CLUSTER_DIR/talosconfig" ] && \
 fi
 
 if [[ "$DEBUG" == "true" ]]; then
-    echo "--- DEBUG MODE ENABLED ---"
+    info "DEBUG mode enabled (set -x + pipefail)"
     set -x
+    set -o pipefail
 fi
 
 # --- Phases ---
@@ -947,10 +948,7 @@ phase_create_vms() {
 #   - Attach Talos ISO to nodes for initial boot
 
 if [ "$SKIP_TERRAFORM" = false ]; then
-    # Temporarily disable pipefail to avoid SIGPIPE from head
-    set +o pipefail
     BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
-    set -o pipefail
     if [ -z "$BRIDGE_NAME" ]; then
         error "No bridge interface found. Please create one and try again."
     fi
@@ -1062,12 +1060,8 @@ if [ "$SKIP_CONFIG_CREATION" = false ]; then
     info "Step 2b: Detecting install disk from VM configuration"
 
     # Get the actual disk device from a control node VM
-    # This ensures we use the correct disk path that libvirt configured
-    # Temporarily disable pipefail to avoid SIGPIPE errors from head
-    set +o pipefail
     FIRST_CONTROL_NODE=$(get_names_by_role control-node | head -1)
     DISK_TARGET=$($SUDO virsh domblklist "$FIRST_CONTROL_NODE" 2>/dev/null | grep -v "^$" | tail -n +3 | grep -v ".iso" | awk '{print $1}' | head -1)
-    set -o pipefail
 
     if [ -z "$DISK_TARGET" ]; then
         warn "Could not detect disk from VM, using default /dev/vda"
@@ -1187,9 +1181,7 @@ cd "$VMS_DIR"
 
 # Ensure BRIDGE_NAME is set (may not be if --skip-terraform was used)
 if [ -z "${BRIDGE_NAME:-}" ]; then
-    set +o pipefail
     BRIDGE_NAME=$(ip -o link show type bridge | awk -F': ' '{print $2}' | head -n 1)
-    set -o pipefail
     if [ -z "$BRIDGE_NAME" ]; then
         error "No bridge interface found for arp-scan. Please create one and try again."
     fi
@@ -1264,7 +1256,7 @@ WORKER_IPS=$(echo "$DYNAMIC_IPS" | grep '^worker-node' || true)
 # Then wait only for first control node to be ready before bootstrapping
 # Workers will join the cluster automatically after bootstrap completes
 
-echo -e "\n==> Step 7: Installing Talos on all nodes (parallel)..."
+info "Step 7: Installing Talos on all nodes (parallel)"
 
 # Combine all node IPs for parallel installation
 if [ -n "$WORKER_IPS" ]; then
@@ -1273,28 +1265,19 @@ else
     ALL_NODE_IPS="$CONTROL_IPS"
 fi
 
-echo -e "\nApplying config to all nodes in parallel:"
-
 if [ -z "$ALL_NODE_IPS" ]; then
-  echo "ERROR: No nodes found in discovered IPs!" >&2
-  exit 1
+  error "No nodes found in discovered IPs!"
 fi
 
 TOTAL_NODES=$(echo "$ALL_NODE_IPS" | wc -l)
-echo "Processing ${TOTAL_NODES} node(s) total..."
-
-# Phase 7.1: Apply configs to ALL nodes in parallel
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 7.1: Applying configurations to all nodes"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+info "Phase 7.1: Applying configurations to ${TOTAL_NODES} node(s)"
 
 NODE_NUMBER=1
 FAILED_NODES=""
 
 declare -A job_pids
 while read -r name dyn_ip; do
-  echo "[${NODE_NUMBER}/${TOTAL_NODES}] Applying config to ${name} (${dyn_ip})..."
+  debug "[${NODE_NUMBER}/${TOTAL_NODES}] Applying config to ${name} (${dyn_ip})..."
   (
     if ! apply_config_with_retry "$name" "$dyn_ip" "./${name}-patched.yaml"; then
       exit 1
@@ -1315,10 +1298,9 @@ done
 # Check for failures
 if [ ${#failed[@]} -gt 0 ]; then
   FAILED_NODES="${failed[*]}"
-  echo "⚠ Warning: Some nodes failed to apply config: $FAILED_NODES"
-  echo "Continuing with remaining nodes..."
+  warn "Some nodes failed to apply config: $FAILED_NODES — continuing with remaining nodes..."
 else
-  echo "✓ All configs applied successfully"
+  success "All configs applied"
 fi
 
 # Set persistent boot order to hd,cdrom for every node.
@@ -1351,40 +1333,26 @@ cd "$CLUSTER_DIR"
 #  Phase 7.2 had nothing to do except flip the persistent boot order — which
 #  is now the one line above.)
 
-# Phase 7.2: Wait ONLY for first control node to be ready
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 7.2: Waiting for first control node to be ready"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
+info "Phase 7.2: Waiting for first control node"
+debug "talosctl endpoints: $CONTROL_STATIC_IPS"
 talosctl config endpoint $CONTROL_STATIC_IPS
 
 FIRST_READY=""
 MAX_WAIT=180 # 3min — extra time after boot order change + VM restart
 ELAPSED=0
 
-# --- STATIC IP REACHABILITY CHECK ---
-# This is the actual verification that the VM booted from disk with the correct config.
-# Polls the STATIC IP (from nodes.yaml) using --client=false (authenticated, with certs).
-# Only succeeds once Talos is running from disk with the new config applied.
-# This is NOT the same as the DHCP IP polling in Phase 7.2 (which used --insecure).
-echo "Checking for first ready control node..."
 while [ -z "$FIRST_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
   for ip in $CONTROL_STATIC_IPS; do
     if talosctl -n "$ip" version --client=false &>/dev/null; then
       FIRST_READY="$ip"
-      echo ""
-      echo "✓ First control node ready: $ip (${ELAPSED}s)"
+      success "First control node ready: $ip (${ELAPSED}s)"
       break
     fi
   done
 
   if [ -z "$FIRST_READY" ]; then
     if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
-      echo -n " [${ELAPSED}s]"
-    else
-      echo -n "."
+      debug "  [${ELAPSED}s] still waiting..."
     fi
     sleep 2
     ELAPSED=$((ELAPSED + 2))
@@ -1392,27 +1360,16 @@ while [ -z "$FIRST_READY" ] && [ $ELAPSED -lt $MAX_WAIT ]; do
 done
 
 if [ -z "$FIRST_READY" ]; then
-  echo ""
-  echo "⚠ Warning: No control nodes ready after ${MAX_WAIT}s"
-  echo "Cannot proceed with bootstrap. Check node status manually."
-  exit 1
+  error "No control nodes ready after ${MAX_WAIT}s — check node status manually."
 fi
-
-echo "✓ Control plane is ready. Workers will join after bootstrap."
 
 # Close the skip-bootstrap conditional that started at Step 2
 else
-    echo -e "\n==> Steps 2-7: Skipped (--skip-bootstrap enabled)"
-    echo "Assuming cluster VMs are already configured and running."
-    
-    # Still need to set up essential variables for later steps
+    info "Steps 2-7: Skipped (--skip-bootstrap enabled)"
     cd "${CLUSTER_DIR}"
-    
-    echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
     talosctl config endpoint $CONTROL_STATIC_IPS
-    
     export TALOSCONFIG="$CLUSTER_DIR/talosconfig"
-    echo "Using talosconfig: $TALOSCONFIG"
+    debug "Using talosconfig: $TALOSCONFIG"
 fi
 
 # At this point, first control node is ready! Bootstrap immediately.
@@ -1422,27 +1379,20 @@ fi
 # This creates the etcd cluster and starts Kubernetes components
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-    echo -e "\n==> Step 8: Bootstrapping Kubernetes cluster..."
-
-    echo "Bootstrapping on: ${FIRST_READY}"
+    info "Step 8: Bootstrapping Kubernetes cluster on ${FIRST_READY}"
     poll_until "Waiting to bootstrap" 300 10 talosctl -n "${FIRST_READY}" bootstrap \
-        && echo "✓ Bootstrap accepted" \
-        || echo "⚠ Bootstrap returned non-zero — may already be bootstrapped, continuing..."
+        && success "Bootstrap accepted" \
+        || warn "Bootstrap returned non-zero — may already be bootstrapped, continuing..."
 
-    echo "Waiting for etcd to come up..."
     if poll_until "Waiting for etcd" 180 10 \
             talosctl -n "$FIRST_READY" service etcd status 2>/dev/null; then
-        echo "✓ Etcd is running and healthy"
+        success "Etcd is running"
     else
-        echo "⚠ Warning: Could not verify etcd status after 180s (may still be starting)"
+        warn "Could not verify etcd status after 180s (may still be starting)"
     fi
 else
-    echo -e "\n==> Step 8: Skipping bootstrap as requested."
-    echo "Cluster should already be bootstrapped."
-
-    set +o pipefail
+    info "Step 8: Skipping bootstrap as requested"
     FIRST_CP_STATIC_IP=$(get_ips_by_role control-node | head -1)
-    set -o pipefail
 fi
 
 # --- Step 8a: Wait for Remaining Control Nodes to Join ---
@@ -1450,37 +1400,25 @@ fi
 
 if [ "$SKIP_BOOTSTRAP" = false ]; then
   if [ "$CONTROL_NODE_COUNT" -gt 1 ]; then
-      echo -e "\n==> Step 8a: Waiting for remaining control nodes to join..."
-      
-      echo "Waiting for all ${CONTROL_NODE_COUNT} control nodes to join etcd..."
+      info "Step 8a: Waiting for ${CONTROL_NODE_COUNT} control nodes to join etcd"
       READY_NODES="$FIRST_READY"
       for ip in $CONTROL_STATIC_IPS; do
           echo "$READY_NODES" | grep -q "$ip" && continue
           if poll_until "  Waiting for control node $ip" 90 2 talosctl -n "$ip" version --client=false; then
               READY_NODES="$READY_NODES $ip"
-              echo "✓ Control node joined: $ip [$(echo "$READY_NODES" | wc -w)/${CONTROL_NODE_COUNT}]"
+              debug "Control node joined: $ip [$(echo "$READY_NODES" | wc -w)/${CONTROL_NODE_COUNT}]"
           fi
       done
 
       FINAL_COUNT=$(echo "$READY_NODES" | wc -w)
       [ "$FINAL_COUNT" -ge "$CONTROL_NODE_COUNT" ] \
-          && echo "✓ All ${CONTROL_NODE_COUNT} control nodes joined!" \
-          || echo "⚠ Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined — check: talosctl -n <ip> get members --namespace=os"
+          && success "All ${CONTROL_NODE_COUNT} control nodes joined" \
+          || warn "Only ${FINAL_COUNT}/${CONTROL_NODE_COUNT} control nodes joined — check: talosctl -n <ip> get members --namespace=os"
   fi
 
-  # ==============================================================================
-  # Step 8b: Verify Worker Nodes
-  # ==============================================================================
-  # Wait for workers to come up and verify they're ready
-  # Workers were installed in parallel during Step 7 and will join automatically
-  # ==============================================================================
-
   if [ -n "$WORKER_IPS" ]; then
-      echo -e "\n==> Step 8b: Waiting for worker nodes to be ready and verifying them..."
-
-      # Get worker static IPs
+      info "Step 8b: Verifying worker nodes"
       WORKER_STATIC_IPS=$(get_ips_by_role worker-node | tr '\n' ' ')
-
       FIRST_WORKER_READY=""
       for ip in $WORKER_STATIC_IPS; do
           if poll_until "Checking worker $ip" 90 2 talosctl -n "$ip" version --client=false; then
@@ -1490,32 +1428,26 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
       done
 
       [ -n "$FIRST_WORKER_READY" ] \
-          && echo "✓ Worker nodes are ready and will join the cluster" \
-          || echo "⚠ No worker nodes ready after 90s — check: kubectl get nodes"
+          && success "Worker nodes are ready and will join the cluster" \
+          || warn "No worker nodes ready after 90s — check: kubectl get nodes"
   else
-      echo "==> Step 8b: No worker nodes configured — skipping."
+      debug "Step 8b: No worker nodes configured — skipping."
   fi
 else
-  echo -e "\n==> Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
+  info "Steps 8a-8b: Skipping node join verification (--skip-bootstrap enabled)"
 fi
 
-# --- Step 9: Retrieve Kubeconfig and Finale! ---
-# Wait for Kubernetes API server to be ready
-# Retrieve and save kubeconfig for kubectl access
-
+# --- Step 9: Retrieve Kubeconfig ---
 if [ "$SKIP_BOOTSTRAP" = false ]; then
-  echo -e "\n==> Step 9: Retrieving kubeconfig..."
+  info "Step 9: Retrieving kubeconfig"
   cd "$SCRIPT_DIR"
-
-  echo "Waiting for Kubernetes API to be ready..."
-
   if ! poll_until "Waiting for kubeconfig" 200 10 \
           talosctl -n "$FIRST_READY" kubeconfig --force; then
-      echo "✗ Failed to retrieve kubeconfig after 200s — try manually: talosctl -n $FIRST_READY kubeconfig"
+      warn "Failed to retrieve kubeconfig after 200s — try manually: talosctl -n $FIRST_READY kubeconfig"
   fi
   export KUBECONFIG="${HOME}/.kube/config"
 else
-  echo -e "\n==> Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
+  info "Step 9: Skipping kubeconfig retrieval (--skip-bootstrap enabled)"
   export KUBECONFIG="${HOME}/.kube/config"
 fi
 }
@@ -1901,9 +1833,7 @@ main() {
 
     # --- Cluster Topology (read after yq is guaranteed to be installed) ---
     HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
-    set +o pipefail
     FIRST_CP_STATIC_IP=$(get_ips_by_role control-node | head -1)
-    set -o pipefail
     CONTROL_STATIC_IPS=$(get_ips_by_role control-node | tr '\n' ' ')
     CONTROL_NODE_COUNT=$(count_by_role control-node)
     WORKER_NODE_COUNT=$(count_by_role worker-node)
