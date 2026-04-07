@@ -1379,14 +1379,6 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     --from-literal=token="$CLOUDFLARE_API_TOKEN" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
     || error "Failed to create/update cloudflare-token secret."
-
-  kubectl create secret generic pihole -n external-dns \
-    --from-literal=EXTERNAL_DNS_PIHOLE_PASSWORD="$PIHOLE_PASSWORD" \
-    --from-literal=EXTERNAL_DNS_PIHOLE_SERVER="$PIHOLE_SERVER" \
-    --from-literal=EXTERNAL_DNS_PIHOLE_API_VERSION="6" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
-    || error "Failed to create/update pihole secret."
-
   # Restart external-dns pods to pick up secret values (if deployment exists)
   echo ""
   if kubectl get deployment -n external-dns --no-headers 2>/dev/null | grep -q .; then
