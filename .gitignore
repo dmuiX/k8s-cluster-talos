@@ -34,3 +34,5 @@ argocd/create-repo-secret.sh
 
 # OpenBao credentials output
 openbao-credentials.txt
+
+.DS_Store
