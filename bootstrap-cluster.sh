@@ -1332,56 +1332,106 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 cd "$VMS_DIR"
 
 # Process ALL nodes in parallel — each node is independent
+# Output is buffered per node to avoid interleaved lines
 declare -A phase72_pids
+declare -A phase72_logs
 while read -r name dyn_ip; do
   if [ -z "$name" ]; then
     continue
   fi
 
-  (
-    echo "Setting boot order for: $name"
-    # Wait for Talos to finish installing (it stops responding when it reboots).
-    # If we shut down the VM before installation is done, the disk write is
-    # interrupted and the node boots into maintenance mode on the next start.
-    echo -n "  [$name] Waiting for installation to finish..."
-    INSTALL_WAIT=0
-    while [ $INSTALL_WAIT -lt 120 ]; do
-      if ! talosctl -n "$dyn_ip" version --insecure &>/dev/null; then
-        echo " done (${INSTALL_WAIT}s)"
-        break
-      fi
-      sleep 3
-      INSTALL_WAIT=$((INSTALL_WAIT + 3))
-    done
-    if [ $INSTALL_WAIT -ge 120 ]; then
-      echo " (timeout — continuing anyway)"
-    fi
+  logfile=$(mktemp)
+  phase72_logs[$name]=$logfile
 
-    # Shutdown VM, wait until off, update boot order, restart
-    $SUDO virsh shutdown "$name" 2>/dev/null || true
-    SHUTDOWN_WAIT=0
-    while $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
-      sleep 2
-      SHUTDOWN_WAIT=$((SHUTDOWN_WAIT + 2))
-      if [ $SHUTDOWN_WAIT -ge 30 ]; then
-        $SUDO virsh destroy "$name" 2>/dev/null || true
-        break
-      fi
+  (
+    # After apply-config --mode=reboot, the VM goes through TWO reboots:
+    #   Reboot 1 — VM reboots, comes back from ISO into installer (DHCP IP, --insecure)
+    #   Installer — Talos writes itself to disk (still reachable on DHCP --insecure)
+    #   Reboot 2 — installation done, post-install reboot
+    #
+    # We must wait through BOTH reboots before touching the VM. Shutting it down
+    # during Reboot 1 leaves a blank disk → next boot falls back to ISO → maintenance.
+    #
+    # Also: libvirt's default on_reboot=restart means Reboot 2 would auto-restart
+    # the VM into ISO again. We must `virsh destroy` immediately after detecting
+    # Reboot 2 to win the race against libvirt's auto-restart.
+
+    # --- DIAGNOSTIC: full timeline of every probe (validates the two-reboot theory) ---
+    T0=$(date +%s)
+    log() {
+      local t=$(($(date +%s) - T0))
+      printf '  [%s t=%3ds] %s\n' "$name" "$t" "$1"
+    }
+    probe() {
+      # Returns: "up" or "down", plus libvirt domstate
+      local rc dom
+      if talosctl -n "$dyn_ip" version --insecure &>/dev/null; then rc=up; else rc=down; fi
+      dom=$($SUDO virsh domstate "$name" 2>/dev/null | tr -d '\n')
+      echo "talosctl=$rc domstate=${dom:-unknown}"
+    }
+
+    log "phase 7.2 start (dyn_ip=$dyn_ip)"
+    log "$(probe)"
+
+    # Step a: wait for node to be reachable on DHCP --insecure (post Reboot 1, in installer)
+    log "step a: waiting for --insecure to RESPOND (max 120s)"
+    WAIT=0
+    while [ $WAIT -lt 120 ] && ! talosctl -n "$dyn_ip" version --insecure &>/dev/null; do
+      sleep 3
+      WAIT=$((WAIT + 3))
+      [ $((WAIT % 9)) -eq 0 ] && log "  step a still waiting: $(probe)"
     done
-    if $SUDO virt-xml "$name" --edit --boot hd,cdrom 2>&1 | sed 's/^/  /'; then
-      echo "  [$name] ✓ Boot order updated (disk->cdrom)"
+    log "step a done after ${WAIT}s: $(probe)"
+
+    # Step b: wait for it to go UNREACHABLE again (Reboot 2 = installation finished)
+    log "step b: waiting for --insecure to STOP responding (max 300s)"
+    WAIT=0
+    while [ $WAIT -lt 300 ] && talosctl -n "$dyn_ip" version --insecure &>/dev/null; do
+      sleep 3
+      WAIT=$((WAIT + 3))
+      [ $((WAIT % 15)) -eq 0 ] && log "  step b still waiting: $(probe)"
+    done
+    log "step b done after ${WAIT}s: $(probe)"
+
+    # Force VM off immediately — race against libvirt's on_reboot=restart default.
+    # virsh shutdown is wrong here: the guest is mid-reboot and won't ACK ACPI.
+    log "calling virsh destroy"
+    $SUDO virsh destroy "$name" &>/dev/null || true
+    log "after destroy: $(probe)"
+
+    # Confirm it's off before editing the persistent XML (virt-xml needs shut-off state)
+    OFF_WAIT=0
+    while [ $OFF_WAIT -lt 10 ] && $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
+      sleep 1
+      OFF_WAIT=$((OFF_WAIT + 1))
+    done
+    log "VM off after ${OFF_WAIT}s wait: $(probe)"
+
+    if $SUDO virt-xml "$name" --edit --boot hd,cdrom &>/dev/null; then
+      # Verify the persistent XML actually has hd as first boot device
+      first_boot=$($SUDO virsh dumpxml "$name" 2>/dev/null \
+          | grep '<boot dev=' | head -1 \
+          | grep -o "dev='[^']*'" | cut -d"'" -f2)
+      if [ "$first_boot" = "hd" ]; then
+        log "✓ boot order updated (hd,cdrom verified)"
+      else
+        log "⚠ virt-xml ran but first boot device is '${first_boot:-unknown}' (expected hd)"
+      fi
     else
-      echo "  [$name] ⚠ Warning: Failed to update boot order"
+      log "⚠ failed to update boot order"
     fi
-    $SUDO virsh start "$name"
-    echo "  [$name] ✓ Started"
-  ) &
+    $SUDO virsh start "$name" &>/dev/null
+    log "virsh start issued, exiting subshell"
+  ) >"$logfile" 2>&1 &
   phase72_pids[$!]=$name
 done < <(echo "$ALL_NODE_IPS")
 
-# Wait for all nodes to finish
+# Wait for all nodes and print output in order
 for pid in "${!phase72_pids[@]}"; do
-  wait "$pid" || echo "⚠ Boot order update failed for ${phase72_pids[$pid]}"
+  name=${phase72_pids[$pid]}
+  wait "$pid" || true
+  cat "${phase72_logs[$name]}"
+  rm -f "${phase72_logs[$name]}"
 done
 
 cd "$CLUSTER_DIR"
