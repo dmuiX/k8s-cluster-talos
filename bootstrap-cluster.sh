@@ -220,24 +220,24 @@ download_and_verify() {
         cmd_prefix="$SUDO"
     fi
 
-    echo "==> Checking ${name}..."
+    debug "Checking ${name}..."
 
     if $cmd_prefix test -f "$dest"; then
-        echo "${name} already exists."
+        debug "${name} already exists."
         return 0
     fi
-    
+
     # Download with 3 retries
-    echo "Downloading ${name}..."
+    info "Downloading ${name}..."
     for i in {1..3}; do
         if $cmd_prefix curl -L --progress-bar -o "$dest" "$url"; then
-            echo "✓ Downloaded successfully."
+            debug "Downloaded ${name} successfully."
             $cmd_prefix chmod 644 "$dest"
             break
         fi
-        
+
         if [ $i -lt 3 ]; then
-            echo "Retry $i/3..."
+            warn "Retry $i/3..."
             $cmd_prefix rm -f "$dest"
             sleep 5
         else
@@ -255,21 +255,21 @@ download_and_verify() {
         return 0
     fi
     
-    echo "Verifying integrity..."
+    debug "Verifying integrity of ${name}..."
     local tmp="/tmp/checksum-$$.txt"
-    
+
     if ! curl -sL "$checksum_url" > "$tmp"; then
-        echo "WARNING: Checksum download failed."
+        warn "Checksum download failed for ${name}."
         return 0
     fi
-    
+
     if [ -n "$pattern" ]; then
         # Extract checksum for specific file pattern
         local expected=$(grep "$pattern" "$tmp" | awk '{print $1}')
         local actual=$($cmd_prefix sha256sum "$dest" | awk '{print $1}')
-        
+
         if [ "$expected" = "$actual" ]; then
-            echo "✓ Verified."
+            debug "Verified ${name}."
         else
             echo "✗ Checksum mismatch!"
             $cmd_prefix rm -f "$dest"
@@ -283,7 +283,7 @@ download_and_verify() {
     else
         # Use sha256sum -c for standard checksum files
         if $cmd_prefix sha256sum -c --ignore-missing < "$tmp" 2>/dev/null | grep -q "$(basename "$dest").*OK"; then
-            echo "✓ Verified."
+            debug "Verified ${name}."
         else
             echo "✗ Verification failed!"
             $cmd_prefix rm -f "$dest"
@@ -338,7 +338,7 @@ EOF
         exit 1
     fi
 
-    echo -e "\nCreating configurations for ${role}s:"
+    info "Creating configurations for ${role}s"
     
     # Read nodes from YAML, convert to JSON for easier parsing
     while read -r node_json; do
@@ -353,7 +353,7 @@ EOF
             '.node_macs.value | to_entries[] | select(.key==$NAME) | .value | ascii_downcase')
         
         local patch_file="./node-configs/${name}-network-patch.yaml"
-        echo "  ✓ ${name} network patch → ${patch_file}"
+        debug "${name} network patch → ${patch_file}"
 
         local template_file base_config
         if [ "$role" == "control-node" ]; then
@@ -442,7 +442,9 @@ poll_until() {
 # --- Helper Functions for Logging ---
 info() { echo -e "==> $*"; }
 success() { echo -e "✓ $*"; }
+warn() { echo -e "⚠ $*" >&2; }
 error() { echo -e "✗ Error: $*" >&2; exit 1; }
+debug() { [ "${DEBUG:-false}" = true ] && echo -e "  [debug] $*" || true; }
 
 # --- Spinner and Wait Function ---
 wait_with_spinner() {
@@ -477,6 +479,11 @@ wait_with_spinner() {
 }
 
 # --- Main Logic Functions ---
+
+# Node-lookup helpers (read NODES_FILE_PATH).
+get_ips_by_role()   { yq e ".nodes[] | select(.role == \"$1\") | .ip"      "$NODES_FILE_PATH"; }
+get_names_by_role() { yq e ".nodes[] | select(.role == \"$1\") | .name"    "$NODES_FILE_PATH"; }
+count_by_role()     { yq e "[.nodes[] | select(.role == \"$1\")] | length" "$NODES_FILE_PATH"; }
 
 ensure_cli_tools_installed() {
   info "Checking for required tools (kubectl, yq, openssl)..."
@@ -698,7 +705,7 @@ NODES_FILE_PATH="$SCRIPT_DIR/nodes.yaml"
 # --- Generate nodes.yaml from .env topology variables ---
 generate_nodes_yaml() {
     local file="$NODES_FILE_PATH"
-    echo "==> Generating nodes.yaml from .env topology..."
+    info "Generating nodes.yaml from .env topology"
 
     cat > "$file" <<YAML
 nodes:
@@ -757,7 +764,7 @@ YAML
         done
     fi
 
-    echo "  ✓ Generated $file (${CP_COUNT} CP + ${WORKER_COUNT:-0} Worker + HAProxy)"
+    success "Generated $file (${CP_COUNT} CP + ${WORKER_COUNT:-0} Worker + HAProxy)"
 }
 
 # Generate nodes.yaml if topology variables are set
@@ -1020,14 +1027,21 @@ echo "==> Step 2a: Performing pre-flight checks..."
 # - openssl: Used for generating secrets
 # - terraform: Infrastructure provisioning
 # - helm: Kubernetes package manager (used by Cilium install)
-if ! command -v yq &> /dev/null; then echo "yq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y yq; fi
-if ! command -v jq &> /dev/null; then echo "jq not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y jq; fi
-if ! command -v curl &> /dev/null; then echo "curl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y curl; fi
-if ! command -v arp-scan &> /dev/null && ! [ -x /usr/sbin/arp-scan ]; then echo "arp-scan not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y arp-scan; fi
-if ! command -v mkisofs &> /dev/null && ! command -v genisoimage &> /dev/null; then
-    echo "genisoimage not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y genisoimage
+missing_pkgs=()
+command -v yq       &>/dev/null || missing_pkgs+=(yq)
+command -v jq       &>/dev/null || missing_pkgs+=(jq)
+command -v curl     &>/dev/null || missing_pkgs+=(curl)
+command -v openssl  &>/dev/null || missing_pkgs+=(openssl)
+if ! command -v arp-scan &>/dev/null && ! [ -x /usr/sbin/arp-scan ]; then
+    missing_pkgs+=(arp-scan)
 fi
-if ! command -v openssl &> /dev/null; then echo "openssl not found, installing..."; $SUDO apt-get update && $SUDO apt-get install -y openssl; fi
+if ! command -v mkisofs &>/dev/null && ! command -v genisoimage &>/dev/null; then
+    missing_pkgs+=(genisoimage)
+fi
+if [ ${#missing_pkgs[@]} -gt 0 ]; then
+    echo "Installing missing packages: ${missing_pkgs[*]}"
+    $SUDO apt-get update && $SUDO apt-get install -y "${missing_pkgs[@]}"
+fi
 if ! command -v terraform &> /dev/null; then
     echo "terraform not found, installing..."
     $SUDO apt-get update && $SUDO apt-get install -y gnupg lsb-release wget
@@ -1053,62 +1067,54 @@ phase_generate_configs() {
 cd "$CLUSTER_DIR"
 
 if [ "$SKIP_CONFIG_CREATION" = false ]; then
-    echo "==> Step 2b: Detecting install disk from VM configuration..."
+    info "Step 2b: Detecting install disk from VM configuration"
 
     # Get the actual disk device from a control node VM
     # This ensures we use the correct disk path that libvirt configured
     # Temporarily disable pipefail to avoid SIGPIPE errors from head
     set +o pipefail
-    FIRST_CONTROL_NODE=$(yq e '.nodes[] | select(.role == "control-node") | .name' "$NODES_FILE_PATH" | head -1)
+    FIRST_CONTROL_NODE=$(get_names_by_role control-node | head -1)
     DISK_TARGET=$($SUDO virsh domblklist "$FIRST_CONTROL_NODE" 2>/dev/null | grep -v "^$" | tail -n +3 | grep -v ".iso" | awk '{print $1}' | head -1)
     set -o pipefail
 
     if [ -z "$DISK_TARGET" ]; then
-        echo "Warning: Could not detect disk from VM, using default /dev/vda"
+        warn "Could not detect disk from VM, using default /dev/vda"
         INSTALL_DISK="/dev/vda"
     else
         # virsh shows the target (e.g., 'vda'), we need full path
         INSTALL_DISK="/dev/${DISK_TARGET}"
-        echo "Detected install disk from VM: ${INSTALL_DISK}"
+        debug "Detected install disk from VM: ${INSTALL_DISK}"
     fi
 
-    echo "Note: Talos will auto-detect the first disk as /dev/sda or /dev/vda during installation"
-    echo ""
-    
-    # Continue with config generation below...
-    echo -e "\n==> Step 3a: Generating secrets bundle..."
+    info "Step 3a: Generating secrets bundle"
     if [ ! -f "secrets.yaml" ]; then
         talosctl gen secrets --output-file secrets.yaml
     else
-        echo "Secrets bundle 'secrets.yaml' already exists."
+        debug "Secrets bundle 'secrets.yaml' already exists."
     fi
 
-    echo -e "\n==> Step 3b: Reading HAProxy IP for Kubernetes endpoint..."
     if [ -z "$HAPROXY_IP" ]; then
-        echo "Error: Could not find HAProxy IP in $NODES_FILE_PATH" >&2
-        exit 1
+        error "Could not find HAProxy IP in $NODES_FILE_PATH"
     fi
-    echo "Kubernetes endpoint will be: ${K8S_ENDPOINT}"
+    debug "Kubernetes endpoint: ${K8S_ENDPOINT}"
 
-    echo -e "\n==> Step 3c: Generating machine configurations..."
+    info "Step 3c: Generating machine configurations"
 
     if [ -f "controlplane.yaml" ]; then
-        echo "⚠ Warning: Machine configurations already exist!"
-        echo "  This will regenerate configs and may break access to existing cluster."
+        warn "Machine configurations already exist — regeneration may break access to existing cluster."
         read -p "Do you want to overwrite them? (yes/no): " -r
         echo
         if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
-            echo "Skipping config generation. Using existing configs."
+            info "Using existing configs."
         else
-            echo "Regenerating configs..."
             rm -f controlplane.yaml worker.yaml 2>/dev/null
             talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
-            echo "  ✓ Generated machine configurations with install disk: $INSTALL_DISK"
+            success "Generated machine configurations with install disk: $INSTALL_DISK"
         fi
     else
         # First time generation
         talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir . --with-secrets ./secrets.yaml --install-disk "$INSTALL_DISK" --force
-        echo "  ✓ Generated machine configurations with install disk: $INSTALL_DISK"
+        success "Generated machine configurations with install disk: $INSTALL_DISK"
     fi
 
     # fix         * static hostname is already set in v1alpha1 config
@@ -1119,14 +1125,11 @@ if [ "$SKIP_CONFIG_CREATION" = false ]; then
     # Remove worker.yaml if no workers configured (talosctl always generates both)
     if [ "${WORKER_NODE_COUNT:-0}" -eq 0 ] && [ -f "worker.yaml" ]; then
         rm -f worker.yaml
-        echo "  ✓ Removed worker.yaml (no worker nodes configured)"
+        debug "Removed worker.yaml (no worker nodes configured)"
     fi
 else
-    echo -e "\n==> Step 3: Skipping config generation (--skip-config-creation flag set)"
-    echo "Using existing configs. Make sure you have:"
-    echo "  - secrets.yaml"
-    echo "  - controlplane.yaml and worker.yaml"
-    
+    info "Step 3: Skipping config generation (--skip-config-creation flag set)"
+    debug "Using existing configs. Expecting: secrets.yaml, controlplane.yaml, worker.yaml"
     INSTALL_DISK="/dev/vda"  # Default, won't be used for generation
 fi
 
@@ -1144,14 +1147,14 @@ fi
 #   - Node-specific patches
 # These configs will be applied to nodes running on DHCP IPs
 
-echo -e "\n==> Step 4-5: Generating node-specific configurations..."
+info "Step 4-5: Generating node-specific configurations"
 cd "$CLUSTER_DIR"
 mkdir -p ./node-configs
 
 if [ "$SKIP_CONFIG_CREATION" = true ]; then
-    echo "Skipping node-specific config generation (--skip-config-creation flag set)."
+    debug "Skipping node-specific config generation (--skip-config-creation flag set)."
 else
-    echo "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
+    debug "Found ${CONTROL_NODE_COUNT} control node(s) and ${WORKER_NODE_COUNT} worker node(s)."
 
     # Use the new helper function to create patch files.
     generate_patch_files_by_role "control-node"
@@ -1456,7 +1459,7 @@ else
     echo "Cluster should already be bootstrapped."
 
     set +o pipefail
-    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+    FIRST_CP_STATIC_IP=$(get_ips_by_role control-node | head -1)
     set -o pipefail
 fi
 
@@ -1494,7 +1497,7 @@ if [ "$SKIP_BOOTSTRAP" = false ]; then
       echo -e "\n==> Step 8b: Waiting for worker nodes to be ready and verifying them..."
 
       # Get worker static IPs
-      WORKER_STATIC_IPS=$(yq e '.nodes[] | select(.role == "worker-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
+      WORKER_STATIC_IPS=$(get_ips_by_role worker-node | tr '\n' ' ')
 
       FIRST_WORKER_READY=""
       for ip in $WORKER_STATIC_IPS; do
@@ -1917,11 +1920,11 @@ main() {
     # --- Cluster Topology (read after yq is guaranteed to be installed) ---
     HAPROXY_IP=$(yq e '.nodes[] | select(.name == "haproxy") | .ip' "$NODES_FILE_PATH")
     set +o pipefail
-    FIRST_CP_STATIC_IP=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | head -1)
+    FIRST_CP_STATIC_IP=$(get_ips_by_role control-node | head -1)
     set -o pipefail
-    CONTROL_STATIC_IPS=$(yq e '.nodes[] | select(.role == "control-node") | .ip' "$NODES_FILE_PATH" | tr '\n' ' ')
-    CONTROL_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "control-node")] | length' "$NODES_FILE_PATH")
-    WORKER_NODE_COUNT=$(yq e '[.nodes[] | select(.role == "worker-node")] | length' "$NODES_FILE_PATH")
+    CONTROL_STATIC_IPS=$(get_ips_by_role control-node | tr '\n' ' ')
+    CONTROL_NODE_COUNT=$(count_by_role control-node)
+    WORKER_NODE_COUNT=$(count_by_role worker-node)
     K8S_ENDPOINT="https://${HAPROXY_IP}:6443"
 
     # Auto-detect scheduling on control planes if not explicitly set
