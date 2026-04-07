@@ -391,6 +391,38 @@ Check `spec.valuesFrom` references, chart version compatibility, and whether dep
 
 ---
 
+## Phase 7 bootstrap sequence — what actually happens and why
+
+This section exists because Phase 7 has been "simplified" and re-broken several times. Each rewrite removed safeguards without understanding what they were defending against. Write down the real model once, here, so the next round of edits starts from facts instead of guesses.
+
+### The VM lifecycle from blank disk to running Talos
+
+1. **VMs are created with boot order `cdrom,hd`** ([vms/nodes.tf](vms/nodes.tf) — `boot_device { dev = ["cdrom", "hd"] }` for control nodes). Disk is blank, so BIOS falls through to the attached Talos ISO and boots into **maintenance mode**. Node comes up on a **DHCP** IP, reachable only via `talosctl --insecure`.
+
+2. **Phase 7.1** runs `talosctl apply-config --insecure --mode=reboot` in parallel against every node's DHCP IP. Two things happen inside Talos as a result:
+   - The machine config is written and the installer runs. The installer pulls the factory installer image (whose tag **must** have a `v` prefix — see commit `d3415a8`, this was the root cause of earlier "Phase 7.2 regressions") and writes Talos to `/dev/vda`.
+   - `--mode=reboot` **does not do a BIOS reboot**. Talos **kexecs** directly into the newly-installed kernel on disk. No firmware, no boot-order lookup, no ISO re-entry. The node transitions in one step from "maintenance on DHCP + `--insecure`" to "fully-installed Talos on its **static** IP with real PKI".
+
+3. **End of Phase 7.1**: a single `virt-xml --edit --boot hd,cdrom` per node updates the **persistent** libvirt XML from `cdrom,hd` to `hd,cdrom`. This is safe on a running VM — `virt-xml --edit` only touches persistent config, never the live instance. It takes effect on the next cold power-on (host reboot, manual `virsh destroy`/`start`, etc.) so future cold boots land on disk instead of falling back into the ISO.
+
+4. **Phase 7.2** (formerly 7.3 — the old 7.2 has been deleted entirely) just waits for the first control node to become ready on its static IP, then bootstrap proceeds normally.
+
+### There is no Phase 7.2
+
+There used to be. It did some combination of: wait for "Reboot 1", wait for "Reboot 2", `virsh destroy`, change boot order, `virsh start`. **All of that was wrong.** The model it was built on ("apply-config causes two BIOS reboots we have to ride out") was never true — Talos kexecs. The node has already left the ISO by the time Phase 7.1 returns. A diagnostic run on 2026-04-07 confirmed this unambiguously: `talosctl --insecure` on the DHCP IP was `down` from t=0 on every node, and `domstate` stayed `running` the whole time. There was nothing to wait for, and nothing to race.
+
+### Why previous "Phase 7.2" rewrites kept breaking
+
+The real failure was one layer up: the factory installer image tag was missing its `v` prefix, so the **install itself failed**. With no bootloader on disk, there was nothing for kexec to jump into, so the VM fell back to the ISO and came up in maintenance again — looking exactly like "Phase 7.2 didn't change the boot order in time". Every rewrite added more waits and more `virsh destroy` dances trying to defend against a symptom whose cause lived in Phase 7.1's image tag. `d3415a8` fixed the real bug; after that, Phase 7.2 had nothing left to do, and its wait loops were pure dead time (~120s per node).
+
+### Rules for anyone touching Phase 7 in the future
+
+- **Do not reintroduce wait-for-reboot loops in Phase 7.2.** Talos kexecs. There is no BIOS reboot to wait for. If nodes are coming up in maintenance mode after a bootstrap, the bug is in the install (image tag, config patch, disk layout) — not in boot-order timing.
+- **Do not `virsh destroy` / `virsh shutdown` nodes right after `apply-config`.** If you catch a node during the narrow window where the installer is still writing to disk, you leave a blank disk and the next boot falls back to the ISO. The kexec model means you don't need to power-cycle at all — the node is already running from disk.
+- **`virt-xml --edit --boot hd,cdrom` does not require a shutdown.** It edits persistent XML only. The live VM is untouched.
+- **Initial boot order in `vms/nodes.tf` must stay `cdrom,hd`.** That's how a blank disk reaches maintenance mode in the first place. Don't "simplify" it to `hd,cdrom` — the disk is empty on first boot and the VM will hang.
+- **If you're about to add a `sleep` or a polling loop to Phase 7, stop and read this section again.** The kexec happens synchronously from `talosctl apply-config`'s point of view: when that command returns, the install+kexec is already done. There is nothing to wait for.
+
 > AI-assisted development with [Claude Code](https://claude.ai/claude-code)
 
 Tested on Functionality: Works for now ;) until they change anything with talos or the rest. 

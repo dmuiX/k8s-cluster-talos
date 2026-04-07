@@ -1323,130 +1323,40 @@ else
   echo "✓ All configs applied successfully"
 fi
 
-# Phase 7.2: Change boot order to disk-first (ISO remains attached as fallback)
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 7.2: Setting boot order (disk first, cdrom fallback)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
+# Set persistent boot order to hd,cdrom for every node.
+#
+# Why this is a one-liner and not a whole phase:
+#   apply-config --mode=reboot above causes Talos to install to disk and kexec
+#   directly into the installed system. The node is already running from disk
+#   on its static IP by the time we get here — no BIOS reboot happened, no
+#   ISO re-boot to race with. We just need to update the *persistent* libvirt
+#   XML so the next cold power-on (host reboot, manual virsh destroy/start,
+#   etc.) also lands on disk instead of falling back into the ISO.
+#
+#   virt-xml --edit operates on persistent XML only; it's safe on a running
+#   VM and takes effect on the next cold boot. No shutdown required.
 cd "$VMS_DIR"
-
-# Process ALL nodes in parallel — each node is independent
-# Output is buffered per node to avoid interleaved lines
-declare -A phase72_pids
-declare -A phase72_logs
-while read -r name dyn_ip; do
-  if [ -z "$name" ]; then
-    continue
+while read -r name _; do
+  [ -z "$name" ] && continue
+  if $SUDO virt-xml "$name" --edit --boot hd,cdrom &>/dev/null; then
+    echo "✓ ${name}: persistent boot order set to hd,cdrom"
+  else
+    echo "⚠ ${name}: failed to update persistent boot order"
   fi
-
-  logfile=$(mktemp)
-  phase72_logs[$name]=$logfile
-
-  (
-    # After apply-config --mode=reboot, the VM goes through TWO reboots:
-    #   Reboot 1 — VM reboots, comes back from ISO into installer (DHCP IP, --insecure)
-    #   Installer — Talos writes itself to disk (still reachable on DHCP --insecure)
-    #   Reboot 2 — installation done, post-install reboot
-    #
-    # We must wait through BOTH reboots before touching the VM. Shutting it down
-    # during Reboot 1 leaves a blank disk → next boot falls back to ISO → maintenance.
-    #
-    # Also: libvirt's default on_reboot=restart means Reboot 2 would auto-restart
-    # the VM into ISO again. We must `virsh destroy` immediately after detecting
-    # Reboot 2 to win the race against libvirt's auto-restart.
-
-    # --- DIAGNOSTIC: full timeline of every probe (validates the two-reboot theory) ---
-    T0=$(date +%s)
-    log() {
-      local t=$(($(date +%s) - T0))
-      printf '  [%s t=%3ds] %s\n' "$name" "$t" "$1"
-    }
-    probe() {
-      # Returns: "up" or "down", plus libvirt domstate
-      local rc dom
-      if talosctl -n "$dyn_ip" version --insecure &>/dev/null; then rc=up; else rc=down; fi
-      dom=$($SUDO virsh domstate "$name" 2>/dev/null | tr -d '\n')
-      echo "talosctl=$rc domstate=${dom:-unknown}"
-    }
-
-    log "phase 7.2 start (dyn_ip=$dyn_ip)"
-    log "$(probe)"
-
-    # Step a: wait for node to be reachable on DHCP --insecure (post Reboot 1, in installer)
-    log "step a: waiting for --insecure to RESPOND (max 120s)"
-    WAIT=0
-    while [ $WAIT -lt 120 ] && ! talosctl -n "$dyn_ip" version --insecure &>/dev/null; do
-      sleep 3
-      WAIT=$((WAIT + 3))
-      [ $((WAIT % 9)) -eq 0 ] && log "  step a still waiting: $(probe)"
-    done
-    log "step a done after ${WAIT}s: $(probe)"
-
-    # Step b: wait for it to go UNREACHABLE again (Reboot 2 = installation finished)
-    log "step b: waiting for --insecure to STOP responding (max 300s)"
-    WAIT=0
-    while [ $WAIT -lt 300 ] && talosctl -n "$dyn_ip" version --insecure &>/dev/null; do
-      sleep 3
-      WAIT=$((WAIT + 3))
-      [ $((WAIT % 15)) -eq 0 ] && log "  step b still waiting: $(probe)"
-    done
-    log "step b done after ${WAIT}s: $(probe)"
-
-    # Force VM off immediately — race against libvirt's on_reboot=restart default.
-    # virsh shutdown is wrong here: the guest is mid-reboot and won't ACK ACPI.
-    log "calling virsh destroy"
-    $SUDO virsh destroy "$name" &>/dev/null || true
-    log "after destroy: $(probe)"
-
-    # Confirm it's off before editing the persistent XML (virt-xml needs shut-off state)
-    OFF_WAIT=0
-    while [ $OFF_WAIT -lt 10 ] && $SUDO virsh domstate "$name" 2>/dev/null | grep -q "running"; do
-      sleep 1
-      OFF_WAIT=$((OFF_WAIT + 1))
-    done
-    log "VM off after ${OFF_WAIT}s wait: $(probe)"
-
-    if $SUDO virt-xml "$name" --edit --boot hd,cdrom &>/dev/null; then
-      # Verify the persistent XML actually has hd as first boot device
-      first_boot=$($SUDO virsh dumpxml "$name" 2>/dev/null \
-          | grep '<boot dev=' | head -1 \
-          | grep -o "dev='[^']*'" | cut -d"'" -f2)
-      if [ "$first_boot" = "hd" ]; then
-        log "✓ boot order updated (hd,cdrom verified)"
-      else
-        log "⚠ virt-xml ran but first boot device is '${first_boot:-unknown}' (expected hd)"
-      fi
-    else
-      log "⚠ failed to update boot order"
-    fi
-    $SUDO virsh start "$name" &>/dev/null
-    log "virsh start issued, exiting subshell"
-  ) >"$logfile" 2>&1 &
-  phase72_pids[$!]=$name
 done < <(echo "$ALL_NODE_IPS")
-
-# Wait for all nodes and print output in order
-for pid in "${!phase72_pids[@]}"; do
-  name=${phase72_pids[$pid]}
-  wait "$pid" || true
-  cat "${phase72_logs[$name]}"
-  rm -f "${phase72_logs[$name]}"
-done
-
 cd "$CLUSTER_DIR"
 
+# (Old Phase 7.2 removed — see commit history. The old wait-for-two-reboots +
+#  destroy + start dance was defending against an install failure caused by
+#  a missing v-prefix on the factory image tag, fixed in d3415a8. With the
+#  install actually succeeding, Talos kexecs into the installed system and
+#  Phase 7.2 had nothing to do except flip the persistent boot order — which
+#  is now the one line above.)
+
+# Phase 7.2: Wait ONLY for first control node to be ready
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Note: ISOs remain attached as fallback boot option"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-echo "✓ All VMs now boot from disk first"
-
-# Phase 7.3: Wait ONLY for first control node to be ready
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Phase 7.3: Waiting for first control node to be ready"
+echo "Phase 7.2: Waiting for first control node to be ready"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 echo "Configuring talosctl endpoints: $CONTROL_STATIC_IPS"
