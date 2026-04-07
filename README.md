@@ -163,6 +163,11 @@ TF_VAR_cloudflare_zone_name=...
 GITHUB_REPO_OWNER=...
 GITHUB_REPO=...
 GITHUB_TOKEN=...
+CLOUDFLARE_API_TOKEN=...
+
+OPENBAO_UNSEAL_KEY=...
+GRAFANA_USER="admin"
+GRAFANA_PASSWORD=...
 ```
 
 ---
@@ -218,6 +223,12 @@ bootstrap-cluster.sh
 The script auto-detects an existing cluster and skips phases that are already done.
 
 ---
+
+## Why is cilium in script and also in the fluxcd repo?
+
+its necessary for the nodes to become ready and to get fluxcd running.
+and in fluxcd repo well its easier to update that way ;).
+so yeah its redundant but its necessary!
 
 ## ⬆️ Upgrade Talos
 
