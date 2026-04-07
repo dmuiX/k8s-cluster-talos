@@ -1,50 +1,9 @@
 #!/bin/bash
+# Talos Kubernetes cluster bootstrap on KVM/libvirt.
+# Run with --help for usage and options.
 
-# --- Talos Kubernetes Cluster Bootstrap Script ---
-# This script automates the complete setup of a Talos Linux Kubernetes cluster
-# on KVM/libvirt with HAProxy load balancer and Cloudflare DNS.
-#
-# Prerequisites:
-#   - KVM/libvirt installed and running
-#   - Bridge network configured (e.g., br0)
-#   - Cloudflare account with API token (optional, use --skip-cloudflare to skip)
-#   - .env file with required variables (see .env.example)
-#   - .envrc file for direnv and manual terraform deployment (optional)
-#   - nodes.yaml file with node definitions
-#     Example: 
-#     - name: Unique node name (e.g., cqontrol-node-1)
-#     - role: "control-node", "worker-node", or "haproxy"
-#     - ip: Static IP address for the node
-#     - mac: MAC address for the node (optional, auto-generated if missing)
-#     - vcpus: Number of vCPUs for the node (optional, default: 2)
-#     - memory_mib: RAM in MiB for the node (optional, default: 2048)
-#     - disk_size_gib: Disk size in GiB for the node (optional, default: 20)
-#   - Talos ISO and Ubuntu image download URLs in .env
-#   - yq, jq, arp-scan installed
-#
-# Usage:
-#   ./bootstrap-cluster.sh [options]
-#
-# OPTIONS:
-#     -h, --help              Show this help message and exit
-#     --skip-iso-download     Skip downloading Talos ISO and Ubuntu image
-#     --skip-terraform        Skip VM creation (use existing VMs)
-#     --skip-config-creation  Skip generating Talos configs (use existing configs)
-#     --skip-bootstrap        Skip cluster bootstrap (use existing cluster)
-#     --skip-cilium-installation  Skip Cilium CNI installation
-#     --skip-argocd-installation  Skip ArgoCD installation
-#     --skip-fluxcd-installation  Skip FluxCD installation
-#     --skip-init-openbao  Skip initializing OpenBao
-#     --skip-cloudflare       Skip Cloudflare DNS record creation
-#     --debug                 Enable verbose bash debug mode (set -x)
-#     --no-cleanup            Disable automatic terraform destroy on error
-#     --cleanup-vms           Destroy only VMs (keeps Cloudflare DNS records)
-#     --cleanup-all           Complete cleanup: VMs + DNS (terraform destroy)
-#
+set -eu  # pipefail is debug-only (see --debug handling below).
 
-set -eu  # Exit on error, undefined vars. pipefail is debug-only (see --debug handling).
-
-# --- Versions ---
 CILIUM_VERSION="1.19.2"
 GATEWAY_API_VERSION="v1.4.0"
 
@@ -99,11 +58,7 @@ EOF
     exit 0
 }
 
-# --- Error Handling and Cleanup ---
-# This function runs when the script exits with an error
-# It performs terraform destroy to clean up partially created infrastructure
-
-CLEANUP_ON_ERROR=true  # Can be set to false with --no-cleanup flag
+CLEANUP_ON_ERROR=true  # set to false with --no-cleanup flag
 
 cleanup_on_error() {
     local exit_code=$?
@@ -132,65 +87,38 @@ cleanup_on_error() {
     fi
 }
 
-# Set trap to run cleanup on script exit (only if error occurs)
 trap cleanup_on_error EXIT
 
-# --- Initial Setup and Configuration ---
-
-# Determine if we need sudo for privileged operations
-# SUDO variable is used throughout the script for commands requiring root
 if [ "$EUID" -ne 0 ]; then
     SUDO="sudo"
 else
     SUDO=""
 fi
 
-# --- Cleanup Functions ---
-
-# ------------------------------------------------------------------------------
-# cleanup_vms_only: Remove only VMs (keeps Cloudflare DNS records)
-# Used for: Quick VM cleanup without touching DNS
-# ------------------------------------------------------------------------------
 cleanup_vms_only() {
     echo -e "\n==> Cleaning up VMs (keeping DNS records)..."
-    
-    # Check if yq is available for parsing YAML
+
     if ! command -v yq &> /dev/null; then
         echo "Error: yq is not installed. Cannot perform cleanup."
         return 1
     fi
 
-    # Locate nodes file (use env var or default)
     local nodes_file_path="${NODES_FILE_PATH:-$SCRIPT_DIR/nodes.yaml}"
     if [ ! -f "$nodes_file_path" ]; then
         echo "Warning: Nodes file not found at $nodes_file_path. Cannot perform cleanup."
         return 1
     fi
 
-    # Extract all node names from nodes.yaml
     local node_names
     node_names=$(yq e '.nodes[].name' "$nodes_file_path")
 
-    # Destroy and undefine each VM
     for name in $node_names; do
         echo "Removing node: $name"
-        virsh destroy "$name" >/dev/null 2>&1 || true  # Force stop VM
-        virsh undefine "$name" --remove-all-storage >/dev/null 2>&1 || true  # Delete VM and disks
+        virsh destroy "$name" >/dev/null 2>&1 || true
+        virsh undefine "$name" --remove-all-storage >/dev/null 2>&1 || true
     done
     echo "--- Cleanup finished ---"
 }
-
-# --- Helper Functions ---
-
-# --- Helper Function: Ensure Custom Talos ISO ---
-# Creates a custom Talos ISO with system extensions:
-#   - qemu-guest-agent: Better VM integration
-#   - amd-ucode: AMD microcode updates
-#   - util-linux-tools: Additional utilities
-#
-# Uses Talos Image Factory API to generate custom ISO with schematic ID
-
-# --- Generic download function with retry and checksum verification ---
 
 download_and_verify() {
     local name="$1"
@@ -235,12 +163,9 @@ download_and_verify() {
             fi
         fi
     done
-    
-    # Verify checksum if provided
-    if [ -z "$checksum_url" ]; then
-        return 0
-    fi
-    
+
+    [ -z "$checksum_url" ] && return 0
+
     debug "Verifying integrity of ${name}..."
     local tmp="/tmp/checksum-$$.txt"
 
@@ -250,7 +175,6 @@ download_and_verify() {
     fi
 
     if [ -n "$pattern" ]; then
-        # Extract checksum for specific file pattern
         local expected=$(grep "$pattern" "$tmp" | awk '{print $1}')
         local actual=$($cmd_prefix sha256sum "$dest" | awk '{print $1}')
 
@@ -267,7 +191,6 @@ download_and_verify() {
             fi
         fi
     else
-        # Use sha256sum -c for standard checksum files
         if $cmd_prefix sha256sum -c --ignore-missing < "$tmp" 2>/dev/null | grep -q "$(basename "$dest").*OK"; then
             debug "Verified ${name}."
         else
@@ -286,27 +209,10 @@ download_and_verify() {
 }
 
 
-# --- Helper Function: Generate Node-Specific Configuration Patches ---
-# Creates network configuration patches for each node based on nodes.yaml
-#
-# This function:
-#   1. Reads node definitions from nodes.yaml (by role)
-#   2. Gets MAC addresses from Terraform output
-#   3. Creates patch files with static network config
-#   4. Applies patches to base configs to create node-specific configs
-#
-# Parameters:
-#   $1 role - Node role to process ("control-node" or "worker-node")
-#
-# Generated files:
-#   - ./node-configs/{name}-network-patch.yaml (temporary patch file)
-#   - ./{name}-patched.yaml (final node-specific config)
-
 generate_patch_files_by_role() {
     local role=$1
-    
-    # necessary to write it like that because EOF isnt working any other way!
-    # Create schematic YAML defining required extensions
+
+    # inline heredoc — no other form works reliably with curl --data-binary here
     local schematic_id=$(curl -sX POST "https://factory.talos.dev/schematics" \
         -H "Content-Type: application/yaml" \
         --data-binary @- <<'EOF' | jq -r '.id'

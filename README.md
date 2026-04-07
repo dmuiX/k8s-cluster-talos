@@ -35,6 +35,16 @@ Ansible adds abstraction that gets in the way when you're bootstrapping a cluste
 
 ---
 
+## ✅ Prerequisites
+
+- **KVM/libvirt** installed and running (`systemctl status libvirtd`)
+- **Bridge network** configured on the host (e.g. `br0`) — the script auto-detects the first bridge
+- **Cloudflare API token** with DNS edit permission (skip with `--skip-cloudflare`)
+
+Everything else (`talosctl`, `terraform`, `kubectl`, `helm`, `flux`, `cilium`, `yq`, `jq`, `arp-scan`, `genisoimage`, `openssl`) is installed by the script if missing.
+
+---
+
 ## 🚀 Quick Start
 
 ```bash
