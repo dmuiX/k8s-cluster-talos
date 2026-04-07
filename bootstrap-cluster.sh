@@ -464,7 +464,7 @@ get_config_from_helmrelease() {
   fi
 }
 create_unseal_secret() {
-  # Generates a base64-encoded 32-byte random key and stores it as a K8s secret.
+  # Either uses existing unseal-key from environment file .env or generates a base64-encoded 32-byte random key and stores it as a K8s secret.
   # This key is used by the OpenBao seal "static" config for auto-unseal.
   # The key is printed to the terminal — back it up in a password manager immediately.
   # Without this key the cluster cannot auto-unseal after a restart.
@@ -475,14 +475,22 @@ create_unseal_secret() {
   # When reading back: kubectl get secret -o json | jq -r '.data."unseal-key"' | base64 -d
   #   → gives back the original base64 string. That is the correct key value.
   # NOTE: jq key has a hyphen — must be quoted: jq -r '.data."unseal-key"' (not .data.unseal-key)
-  info "Generating static unseal key and creating secret 'openbao-unseal-key' in namespace 'openbao'..."
 
-  local static_key
-  static_key=$(openssl rand -base64 32)
+  if [[ -z "$OPENBAO_UNSEAL_KEY" ]]; then
+      info "Generating static unseal key and creating secret 'openbao-unseal-key' in namespace 'openbao'..."
+
+      local static_key
+      static_key=$(openssl rand -base64 32)
+  else
+      info "Using existing unseal key and creating secret 'openbao-unseal-key' in namespace 'openbao'..."
+
+      local static_key
+      static_key="$OPENBAO_UNSEAL_KEY"
+  fi
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  UNSEAL KEY (back this up now!): $static_key"
+  echo "  OPENBAO_UNSEAL KEY (back this up now!): $static_key"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
 
@@ -570,7 +578,7 @@ credentials_prompt() {
 
 # --- Load Environment Variables ---
 # Paths (VMS_DIR, CLUSTER_DIR, NODES_FILE_PATH) are auto-set from SCRIPT_DIR.
-# .env provides: CLUSTER_NAME, TALOS_ISO_URL, UBUNTU_IMAGE_URL, TF_VAR_*, etc.
+# .env provides: CLUSTER_NAME, TALOS_ISO_URL, UBUNTU_IMAGE_URL, TF_VAR_*, OPENBAO_UNSEAL_KEY etc.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VMS_DIR="$SCRIPT_DIR/vms"
@@ -1117,15 +1125,17 @@ fi
 #
 #   virt-xml --edit operates on persistent XML only; it's safe on a running
 #   VM and takes effect on the next cold boot. No shutdown required.
-cd "$VMS_DIR"
-while read -r name _; do
-  [ -z "$name" ] && continue
-  if $SUDO virt-xml "$name" --edit --boot hd,cdrom &>/dev/null; then
+
+NAMES=$(get_names_by_role control-node)
+for NAME in NAMES; do
+  [ -z $NAME ] && continue
+  if $SUDO virt-xml $NAME --edit --boot hd,cdrom &>/dev/null; then
     echo "✓ ${name}: persistent boot order set to hd,cdrom"
   else
     echo "⚠ ${name}: failed to update persistent boot order"
   fi
-done < <(echo "$ALL_NODE_IPS")
+done
+
 cd "$CLUSTER_DIR"
 
 info "Phase 7.2: Waiting for first control node"
@@ -1369,16 +1379,25 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
   fi
 
   : "${CLOUDFLARE_API_TOKEN:?Error: CLOUDFLARE_API_TOKEN is not set.}"
+  : "${GRAFANA_USER:?Error: GRAFANA_USER is not set.}"
+  : "${GRAFANA_PASSWORD:?Error: GRAFANA_PASSWORD is not set.}"
   : "${GITHUB_REPO_OWNER:?Error: GITHUB_REPO_OWNER is not set.}"
   : "${GITHUB_REPO:?Error: GITHUB_REPO is not set.}"
 
   kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
-
+  kubectl create ns monitoring --dry-run=client -o yaml | kubectl apply -f -
+  
   kubectl create secret generic cloudflare-token -n cert-manager \
     --from-literal=token="$CLOUDFLARE_API_TOKEN" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+    || error "Failed to create/update cloudflare-token secret." 
+
+  kubectl create secret generic cloudflare-token -n external-dns \
+    --from-literal=token="$CLOUDFLARE_API_TOKEN" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
     || error "Failed to create/update cloudflare-token secret."
+
   # Restart external-dns pods to pick up secret values (if deployment exists)
   echo ""
   if kubectl get deployment -n external-dns --no-headers 2>/dev/null | grep -q .; then
@@ -1387,6 +1406,12 @@ if [ "$SKIP_FLUXCD_INSTALLATION" = false ]; then
     kubectl rollout status deployment -n external-dns --timeout=60s 2>/dev/null || true
   fi
 
+  kubectl create secret generic grafana-credentials -n monitoring \
+    --from-literal=user="$GRAFANA_USER" \
+    --from-literal=password="$GRAFANA_PASSWORD" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null \
+    || error "Failed to create/update grafana-credentials secret."
+ 
   if ! command -v flux &> /dev/null; then
     info "Installing FluxCD CLI"
     curl -s https://fluxcd.io/install.sh | $SUDO bash
