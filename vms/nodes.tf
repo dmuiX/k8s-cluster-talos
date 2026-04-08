@@ -117,7 +117,10 @@ resource "libvirt_domain" "node_domain" {
       { dev = "hd" }
     ]
   }
-
+  features = {
+    acpi = true
+    apic = {}
+  }
   cpu = {
     mode  = "host-passthrough"
     check = "none"
