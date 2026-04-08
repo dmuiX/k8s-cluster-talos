@@ -17,10 +17,9 @@ output "dns_records" {
 }
 
 output "node_macs" {
-  description = "Map of node names to their MAC addresses"
   value = {
     for name, domain in libvirt_domain.node_domain :
-    name => domain.network_interface[0].mac
+    name => domain.devices.interfaces[0].mac.address
   }
 }
 

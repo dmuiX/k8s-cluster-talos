@@ -7,6 +7,8 @@ machine:
       - deviceSelector:
           hardwareAddr: ${MAC}
         dhcp: false
+        vip:
+          ip: ${VIRTUAL_IP}
         addresses:
           - ${IP}/24
         routes:
@@ -15,7 +17,7 @@ machine:
     nameservers: ${NAMESERVERS_ARRAY}
   time:
     servers:
-      - 192.168.1.1 
+      - 192.168.1.1
       - time.cloudflare.com
   kubelet:
     extraMounts:

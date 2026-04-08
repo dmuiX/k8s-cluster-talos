@@ -1,13 +1,13 @@
 terraform {
-  required_version = ">= 0.13"
+  required_version = ">= 1.14"
   required_providers {
     cloudflare = { 
       source  = "cloudflare/cloudflare"
-      version = "~> 5"
+      version = "~> 5.18.0"
     }   
     libvirt = { 
       source  = "dmacvicar/libvirt"
-      version = "~>0.8.3"
+      version = "~>0.9.7"
     }
   }
 }
