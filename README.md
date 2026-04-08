@@ -5,17 +5,17 @@ Fully automated Talos Linux Kubernetes cluster on KVM/libvirt — one script, ze
 Terraform provisioning → Cilium CNI → FluxCD GitOps → Cloudflare DNS → Longhorn storage → OpenBao secrets
 
 ## 🤔 Why Talos? Why a single bash script?
- 
+
 This cluster is the result of multiple failed attempts at on-prem Kubernetes:
- 
+
 1. **Multipass + MicroK8s** (Ubuntu) — VMs were unreliable, DNS and hostname handling was a pain
 2. **Vagrant** — overly complex, dual IPs and hostname management made it frustrating
 3. **Ansible + KVM** — way too much manual plumbing to get right
 4. **Oracle Cloud free tier** — free VMs were never actually available
- 
+
 **Why Talos?**
 Talos is an immutable, API-driven OS built specifically for Kubernetes — no SSH, no package manager, no drift. It brings everything out of the box: etcd, kubelet, containerd, all pre-configured. Upgrades are a single `talosctl upgrade` command — no apt, no reboots into broken states. Compared to provisioning Ubuntu/Debian nodes and manually bootstrapping Kubernetes on top, Talos removes an entire layer of complexity.
- 
+
 **Why one bash script instead of Ansible?**
 Ansible adds abstraction that gets in the way when you're bootstrapping a cluster from scratch. You end up writing playbooks that shell out to `talosctl` and `terraform` anyway — at that point, just use bash directly. One script, linear flow, easy to debug with `bash -x`. The script auto-detects what's already done and skips completed phases, so it's idempotent without the Ansible overhead.
 
@@ -408,6 +408,117 @@ Check `spec.valuesFrom` references, chart version compatibility, and whether dep
 | **`prevent_destroy` can't use variables** | `prevent_destroy = var.x` doesn't work in Terraform. Remove the block manually to toggle. |
 | **No Talos kernel params via libvirt** | Passing `kernel`/`cmdline` via the Terraform provider causes kernel panic on boot. |
 | **VM tuning via XSL, not Terraform** | IOThreads, CPU topology, crash behavior → edit `vms/optimizations.xsl`, not the `.tf` files. Referenced via `xml { xslt = ... }` in `nodes.tf`. |
+| **dmacvicar/libvirt 0.9.x drops the `<features>` block on q35 → no PCIe enumeration in guest** | See section below. Always set `features = { acpi = {}, apic = {} }` at the domain level in `nodes.tf`. |
+
+---
+
+## 🐞 Debug Story: Talos VMs without network after the Terraform overhaul
+
+This one cost a full debug session. Writing it down so the next person (or the next overhaul) doesn't repeat it.
+
+### Symptom
+
+After the Terraform overhaul to `dmacvicar/libvirt ~> 0.9.7` (commit `fe42438`), all Talos VMs came up in maintenance mode but had **no network at all**:
+
+- Talos dashboard: no IP, no hostname, `connectivity: false`, no MAC on the Network page.
+- A Windows VM on the **same** bridge `br0` worked fine (DHCP from the LAN).
+- The previous Terraform code (older provider, machine type `pc`/i440fx, XSLT-based tuning) had no problem.
+
+### What was checked and ruled out
+
+| Layer | Check | Result |
+|---|---|---|
+| Tap device | `ip link show vnetXXX` | `UP, LOWER_UP, master br0` ✅ |
+| Bridge enslavement | `bridge link show` | tap is slave of `br0` ✅ |
+| Bridge / DHCP | Windows VM gets a lease on the same bridge | DHCP server reachable ✅ |
+| Generated XML interface block | `virsh dumpxml \| sed -n '/<interface/,/<\/interface>/p'` | `virtio`, `link state='up'`, valid `52:54:00:…` MAC ✅ |
+| Host wire activity | `tcpdump -i br0 -e -nn ether host 52:54:00:…` during boot | **zero packets** — no ARP, no DHCP, no IPv6 RS ❌ |
+| MAC consistency | TF's `md5(name)` slicing vs. `bootstrap-cluster.sh:get_mac_for_node` | identical ✅ |
+| Bridge auto-detect picking the wrong bridge | `br0` is set in virt-manager, tap really is enslaved to it | not the cause ✅ |
+| ISO integrity | Stock `metal-amd64.iso` from siderolabs releases (`metal-amd64.iso` SHA256 vs upstream) | matches ✅ |
+| Schematic | Used only later in the `installer` image string in [templates/control-node-patch.yaml](templates/control-node-patch.yaml), irrelevant for first boot | not the cause ✅ |
+| Talos really is running, on the right tab | Confirmed visually on VNC | yes ✅ |
+| Boot order edge cases (`cdrom,hd` falling through to a blank disk) | Talos dashboard is visible, so kernel is alive | not the cause ✅ |
+| q35 PCIe controller layout | `virsh dumpxml \| sed -n '/<controller/,/\/controller>/p'` | standard q35 with 6 auto-added `pcie-root-port`s, NIC behind `pci.1` — perfectly normal ✅ |
+
+The killer fact: **`tcpdump` saw absolutely nothing on the wire**, while everything host-side and XML-side looked correct. That meant the guest itself wasn't bringing the NIC up — but Talos's stock ISO has virtio_net built into the kernel, so this should be impossible.
+
+### The cross-OS sanity check that cracked it
+
+Booted **Alpine standard** in the same VM slot (Alpine has virtio_net in every variant — it's one of the most common KVM guests on the planet). Alpine **also** saw only `lo`. That definitively eliminated Talos as the cause: the guest kernel, *any* guest kernel, wasn't seeing a NIC.
+
+So the problem had to be in what qemu was actually exposing to the guest, not in any guest OS.
+
+### Root cause
+
+Looking at the **complete** domain XML (not just the `<interface>` block), one entire element was missing that normally wouldn't even be questioned:
+
+```xml
+<!-- This was NOT in the generated XML: -->
+<features>
+  <acpi/>
+  <apic/>
+</features>
+```
+
+On q35, **PCIe device enumeration in the guest goes through ACPI tables**. Without `<acpi/>`:
+
+- The guest sees the q35 chipset itself (LPC, integrated ICH9 SATA at bus `0x00` slot `0x1f` — that's how the boot CDROM still worked)
+- The guest **cannot enumerate any `pcie-root-port`** or anything behind one
+- That includes the virtio NIC at bus `0x01` and the virtio disk at bus `0x04`
+
+That's why the guest boots from the SATA CDROM (chipset-integrated, no ACPI needed) but never sees the virtio NIC. Windows happened to work because its VM was originally created via virt-manager which always sets `<features><acpi/><apic/></features>` by default.
+
+### Why the old code was fine and the new code wasn't
+
+| | Old (commit `63cd458`) | New (commit `fe42438`) |
+|---|---|---|
+| Provider | `dmacvicar/libvirt < 0.9` | `dmacvicar/libvirt ~> 0.9.7` (new framework schema) |
+| Machine type | not set → libvirt default `pc` (i440fx) | `q35` |
+| Tuning | `xml { xslt = optimizations.xsl }` | native attributes |
+| `<features>` in generated XML | present (libvirt auto-adds defaults when TF doesn't fight it) | **absent** |
+
+Two things have to coincide for this bug to bite:
+
+1. The provider's new framework schema generates a domain **without any `<features>` element**, which suppresses libvirt's normal auto-add of `<acpi/>`/`<apic/>`.
+2. The machine type is `q35`, where ACPI is mandatory for PCIe enumeration. On `pc`/i440fx the same missing-features block is mostly harmless because i440fx enumerates devices via legacy PCI mechanisms that don't strictly require ACPI.
+
+The overhaul changed both at once, so the regression was masked behind "everything changed, where do I even start".
+
+### Fix
+
+Add an explicit `features` block at the domain level in [vms/nodes.tf](vms/nodes.tf):
+
+```hcl
+resource "libvirt_domain" "node_domain" {
+  # ...
+
+  features = {
+    acpi = {}
+    apic = {}
+  }
+
+  # ...
+}
+```
+
+Verify after `terraform apply` that the generated XML now contains:
+
+```xml
+<features>
+  <acpi/>
+  <apic/>
+</features>
+```
+
+After that, Talos sees the virtio NIC, DHCPs in maintenance mode, and `apply-config` can proceed normally.
+
+### Lessons
+
+- **When `dumpxml` looks "fine", check what's *missing*, not just what's there.** A missing `<features>` is invisible until you look for it specifically.
+- **A cross-OS boot test (Alpine in the same VM slot) is the cheapest way to partition guest-vs-host bugs.** Took 5 minutes, eliminated an entire hypothesis class.
+- **`tcpdump` returning zero packets is a *strong* signal**, not a "maybe filter wrong" signal. If host-side everything checks out and the wire is silent, the guest doesn't have the device — period.
+- **When a Terraform provider migration changes more than one thing at once** (provider major version + machine type + schema style), expect at least one regression that hides behind the others.
 
 ---
 
@@ -445,4 +556,4 @@ The real failure was one layer up: the factory installer image tag was missing i
 
 > AI-assisted development with [Claude Code](https://claude.ai/claude-code)
 
-Tested on Functionality: Works for now ;) until they change anything with talos or the rest. 
+Tested on Functionality: Works for now ;) until they change anything with talos or the rest.
