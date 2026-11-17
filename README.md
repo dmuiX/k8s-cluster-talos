@@ -7,9 +7,9 @@ This repository and **[dmuiX/fluxcd.k8sdev.cloud](https://github.com/dmuiX/fluxc
 - **Here — provisioning and bootstrap:** create the VMs, install Talos, initialize Kubernetes, and bring up the networking needed for GitOps.
 - **Companion repository — steady-state GitOps:** reconcile the cluster services and workloads after bootstrap, including the Longhorn and OpenBao dependencies expected by this script.
 
-> **Status:** an earlier learning/reference cluster, not a claim of a currently running production platform or a freshly reproducible deployment. The tracked code contains environment-specific assumptions and unfinished paths. Review [configuration](#configuration-reference), [safety notes](#safety-and-cleanup), and [current limitations](#current-limitations) before using it on an isolated lab host.
+> **Status:** an earlier learning/reference cluster, not a claim of a currently running production platform or a freshly reproducible deployment. The tracked code contains environment-specific assumptions and unfinished paths. Review [configuration](#-configuration-reference), [safety notes](#-safety-and-cleanup), and [current limitations](#-current-limitations) before using it on an isolated lab host.
 
-[Architecture](#architecture-and-bootstrap-flow) · [Prerequisites](#prerequisites) · [Preparation](#preparation) · [Troubleshooting](#troubleshooting) · [Reference notes](#reference-notes)
+[Architecture](#-architecture-and-bootstrap-flow) · [Prerequisites](#-prerequisites) · [Preparation](#-preparation) · [Troubleshooting](#-troubleshooting) · [Reference notes](#-reference-notes)
 
 ## 🤔 Why Talos? Why a single bash script?
 
@@ -26,7 +26,7 @@ Talos is an immutable, API-driven OS built specifically for Kubernetes — witho
 **Why one bash script instead of Ansible?**
 For this learning project, a single script keeps the sequence of `talosctl`, `terraform`, and Kubernetes CLI operations visible in one place. Named phase functions and retry helpers make the bootstrap process easier to trace. Some existing resources are detected and skipped, but that is not a guarantee of safe, idempotent reruns. Debug tracing can also expose credentials.
 
-## Stack
+## 📦 Stack
 
 | Component | Responsibility |
 | --- | --- |
@@ -34,27 +34,27 @@ For this learning project, a single script keeps the sequence of `talosctl`, `te
 | Talos Linux + Kubernetes | Node OS, control plane, and API virtual IP (`VIRTUAL_IP:6443`) |
 | Cilium | CNI, kube-proxy replacement, L2 announcements, and Gateway API support; uses KubePrism on port `7445` |
 | FluxCD | Default GitOps handoff to the companion repository |
-| ArgoCD | Retained alternative installation function and Application example; see [GitOps choices](#gitops-choices) |
+| ArgoCD | Retained alternative installation function and Application example; see [GitOps choices](#-gitops-choices) |
 | Cloudflare | Optional Terraform-managed node DNS records; separate in-cluster DNS/certificate credentials for Flux |
 | Longhorn + OpenBao | GitOps-managed storage and secrets services; optional OpenBao initialization here |
 
 There is no single version table: Talos/Cilium inputs come from local configuration, some manifests use fixed versions or `latest`, and other services come from GitOps. Check [provider constraints](vms/provider.tf), [machine patches](templates/), and [script inputs](bootstrap-cluster.sh) together before choosing compatible releases.
 
-## Prerequisites
+## 📋 Prerequisites
 
 - **An x86-64 Linux KVM host** with libvirt running, permission to use `virsh`, and a usable `default` storage pool. The preflight installer assumes an apt-based host and root or `sudo` access; this is not a portable macOS/Windows launcher.
 - **A LAN bridge with DHCP** for Talos maintenance-mode discovery, plus unused static node addresses and a control-plane virtual IP on the same network. The VM phase selects the first bridge returned by `ip`; verify that selection on hosts with multiple bridges.
-- **Enough RAM and disk space** for all VMs, Talos extensions, and workloads; see [memory planning](#memory-planning).
+- **Enough RAM and disk space** for all VMs, Talos extensions, and workloads; see [memory planning](#-memory-planning).
 - **Working CLI tools:** `kubectl`, Mike Farah `yq` v4, `jq`, `curl`, `openssl`, `arp-scan`, `talosctl`, `terraform`, `helm`, `virsh`, and GNU utilities such as `sha256sum`, `md5sum`, `join`, and `timeout`. Flux/Cilium CLIs are needed for their respective phases. The script attempts to install some missing tools, but uses `kubectl` before its late fallback installer; do not rely on a clean-host dependency setup.
 - **Network access** to image releases, Talos Image Factory, package repositories, GitHub, and container registries. Bootstrap downloads tools/manifests; it is not an offline workflow.
-- **Credentials for the paths you use:** Cloudflare for node DNS; GitHub and application credentials for the default Flux path. See [configuration](#configuration-reference) and [GitOps choices](#gitops-choices).
+- **Credentials for the paths you use:** Cloudflare for node DNS; GitHub and application credentials for the default Flux path. See [configuration](#-configuration-reference) and [GitOps choices](#-gitops-choices).
 
 Review host-specific assumptions in [vms/nodes.tf](vms/nodes.tf) and both [Talos patches](templates/) as well: fixed CPU topology/`topoext`, AMD microcode in the generated schematic, `/24` node addresses, time servers, and reserved hugepages are not universal defaults.
 
-## Preparation
+## 🚀 Preparation
 
-1. Read [bootstrap-cluster.sh](bootstrap-cluster.sh), the [Terraform inputs](vms/variables.tf), and the [safety notes](#safety-and-cleanup). This is a reference implementation, not a copy-and-run deployment contract.
-2. Create a private, shell-syntax **`.env`** at the repository root using the [configuration reference](#configuration-reference). There is **no tracked `.env.example`**. The script sources `.env` as Bash, so only use trusted contents. Its interactive prompt covers a subset of the required inputs, not a complete configuration wizard.
+1. Read [bootstrap-cluster.sh](bootstrap-cluster.sh), the [Terraform inputs](vms/variables.tf), and the [safety notes](#-safety-and-cleanup). This is a reference implementation, not a copy-and-run deployment contract.
+2. Create a private, shell-syntax **`.env`** at the repository root using the [configuration reference](#-configuration-reference). There is **no tracked `.env.example`**. The script sources `.env` as Bash, so only use trusted contents. Its interactive prompt covers a subset of the required inputs, not a complete configuration wizard.
 3. Choose a control-plane/worker layout and compatible image/component versions. Keep the downloaded ISO path and Terraform's ISO input aligned; do not use the historical `haproxy` entry in `nodes.yaml.example` for the current flow.
 4. Choose whether to use Flux and OpenBao. Both phases are enabled by default. Skipping Flux without also skipping OpenBao leaves initialization waiting for Flux-managed resources.
 5. Back up existing libvirt/Terraform state, cluster credentials, and any persistent data before running against an existing environment.
@@ -65,7 +65,7 @@ For a **reviewed, disposable lab** with configuration already supplied, this exa
 ./bootstrap-cluster.sh --skip-cloudflare --skip-fluxcd-installation --skip-init-openbao --no-cleanup
 ```
 
-This still creates VMs and changes the cluster. **`--no-cleanup` is not a universal destruction guard:** the Terraform failure branch still calls `terraform destroy`. Terraform may also request Cloudflare inputs even with DNS disabled; see [current limitations](#current-limitations).
+This still creates VMs and changes the cluster. **`--no-cleanup` is not a universal destruction guard:** the Terraform failure branch still calls `terraform destroy`. Terraform may also request Cloudflare inputs even with DNS disabled; see [current limitations](#-current-limitations).
 
 After deployment, check the intended kubeconfig context before inspecting resources:
 
@@ -76,7 +76,7 @@ kubectl get pods -A
 cilium status --namespace cilium
 ```
 
-## Topology
+## 🌐 Topology
 
 The script regenerates **`nodes.yaml`** from `.env` topology inputs before its main phases, including on detected-cluster reruns. Treat that file as generated output, not the durable place to edit topology. [nodes.yaml.example](nodes.yaml.example) illustrates an older layout and still includes HAProxy; it is not an exact template for current bootstrap.
 
@@ -88,7 +88,7 @@ With `WORKER_COUNT=0`, the script enables `allowSchedulingOnControlPlanes`. Over
 
 ---
 
-## Memory planning
+## 🧠 Memory planning
 
 Budget for **the sum of configured guest RAM plus host/QEMU overhead**, rather than assuming low pod usage makes overcommit safe. QEMU's resident memory depends on guest activity and allocation settings; it is not universally equal to the configured maximum.
 
@@ -98,14 +98,14 @@ Check actual host-available memory, iGPU/shared-memory reservations, and workloa
 
 ---
 
-## Configuration reference
+## 🔧 Configuration reference
 
 `.env` values are exported when sourced. Use quoted shell assignments and keep credentials private. This table describes inputs, not a ready-to-run configuration.
 
 | Inputs | Purpose / caveat |
 | --- | --- |
 | `CLUSTER_NAME` | Name passed to `talosctl gen config` |
-| Topology variables [above](#topology) | Counts, resources, addresses, DNS, and optional scheduling override |
+| Topology variables [above](#-topology) | Counts, resources, addresses, DNS, and optional scheduling override |
 | `TALOS_VERSION` | Installer version **without** the leading `v`; both patches add it to the factory image tag |
 | `TALOS_ISO_URL`, `TALOS_CHECKSUM_URL` | Select matching release-specific ISO and checksum URLs; the checksum fallback points to `latest`, not necessarily the chosen ISO |
 | `METALISO_ABSOLUTE_PATH` | Download destination; defaults to the repository's `vms/metal-amd64.iso` |
@@ -121,11 +121,11 @@ Check actual host-available memory, iGPU/shared-memory reservations, and workloa
 
 The script derives `VMS_DIR`, `CLUSTER_DIR`, and `NODES_FILE_PATH` from its own location; do not override them in `.env`. It exports `TF_VAR_nodes_file_path` and `TF_VAR_bridge_name` during VM creation. The latter comes from bridge auto-detection, which overwrites a configured `BRIDGE_NAME` in that phase.
 
-Treat `.env`, `cluster/`, generated machine configs, kubeconfigs, Terraform state, and `openbao-credentials.txt` as sensitive. Keep keys and recovery material backed up outside the cluster and out of terminal/session recordings. See [current limitations](#current-limitations) for version and rerun caveats.
+Treat `.env`, `cluster/`, generated machine configs, kubeconfigs, Terraform state, and `openbao-credentials.txt` as sensitive. Keep keys and recovery material backed up outside the cluster and out of terminal/session recordings. See [current limitations](#-current-limitations) for version and rerun caveats.
 
 ---
 
-## Options
+## 🧰 Options
 
 ```text
 ./bootstrap-cluster.sh [OPTIONS]
@@ -149,7 +149,7 @@ Treat `.env`, `cluster/`, generated machine configs, kubeconfigs, Terraform stat
 
 ---
 
-## Architecture and bootstrap flow
+## 🧭 Architecture and bootstrap flow
 
 ```text
 .env → generated nodes.yaml → Terraform → Talos VMs on a LAN bridge
@@ -187,7 +187,7 @@ The Kubernetes API uses the Talos VIP configured in the control-plane patch. **C
 
 Existing-cluster detection checks for local credentials and a successful `kubectl get nodes`, then skips selected phases. It is not a comprehensive check of cluster identity, health, or workload readiness; verify your kubeconfig context before rerunning.
 
-## GitOps choices
+## 🔄 GitOps choices
 
 - **Flux (default):** uses `GITHUB_REPO_OWNER` / `GITHUB_REPO`, branch `main`, path `clusters`, token authentication, `--personal`, and `--private=true`. It writes bootstrap manifests to GitHub and reconciles them in the cluster. Adapt these assumptions before using another repository layout or an organization. See the [companion repository](https://github.com/dmuiX/fluxcd.k8sdev.cloud) and [historical Flux notes](fluxcd/fluxcd.md).
 - **ArgoCD (retained alternative):** the script contains an HA install function, but initializes its skip flag to `true` and has **no CLI enable switch**. The [Application example](argocd/deployment.yml) points to a separate `argocd.k8sdev.cloud` repository and contains a `${GITHUB_REPO_OWNER}` placeholder that needs rendering; plain `kubectl apply` does not expand it. Installation and repository credentials need separate review. [ArgoCD notes](docs/argocd.md) document earlier experiments, not the default workflow.
@@ -202,7 +202,7 @@ OpenBao initialization assumes the companion stack exposes HelmReleases named `c
 
 Before a rerun, preserve the original generated key in protected private configuration and independently backed-up recovery custody, or pass `--skip-init-openbao`. Do not generate a replacement key as a troubleshooting step for an initialized instance.
 
-## Upgrade reference
+## 📈 Upgrade reference
 
 Upgrades are a separate maintenance operation, not a guaranteed bootstrap feature. Check the [Talos documentation](https://docs.siderolabs.com/) for the supported source/target path and client compatibility. Back up etcd, persistent volumes, and recovery credentials first; plan for quorum and storage replica health. [Earlier upgrade notes](docs/upgrade-cluster.md) record Longhorn trouble, not a validated upgrade runbook.
 
@@ -236,7 +236,7 @@ Replace the placeholders, verify the target release's CLI semantics, and check n
 
 ---
 
-## File structure
+## 📂 File structure
 
 ```text
 bootstrap-cluster.sh          Main orchestration script
@@ -255,7 +255,7 @@ docs/archive/                 Earlier plans and session notes
 
 ---
 
-## Safety and cleanup
+## 🔒 Safety and cleanup
 
 **Cleanup destroys data.** Read the implementation and confirm VM names, storage, Terraform state, and backups before using either flag:
 
@@ -268,7 +268,7 @@ docs/archive/                 Earlier plans and session notes
 
 These operations are broader than a Kubernetes reset. Store recovery material outside the affected VMs and repository checkout. Do not use a rerun or cleanup flag as the first diagnostic step for a valuable cluster.
 
-## Troubleshooting
+## 🔍 Troubleshooting
 
 Most cluster issues fall into a few categories:
 
@@ -360,7 +360,7 @@ Check `spec.valuesFrom` references, chart version compatibility, and whether dep
 
 ---
 
-## Current limitations
+## 🚧 Current limitations
 
 These are observations from the tracked code, not results of a fresh deployment test.
 
@@ -382,7 +382,7 @@ The detailed debugging and lifecycle notes below retain useful project history w
 
 ---
 
-## Debug story: Talos VMs without network after the Terraform overhaul
+## 🐛 Debug story: Talos VMs without network after the Terraform overhaul
 
 A historical incident retained for its debugging method. The current HCL already includes explicit ACPI/APIC features; this is not a claim that all libvirt 0.9.x deployments have the same problem.
 
@@ -479,7 +479,7 @@ The project notes record that enabling these features restored NIC visibility an
 
 ---
 
-## Phase 7 lifecycle: from ISO to installed Talos
+## 💿 Phase 7 lifecycle: from ISO to installed Talos
 
 Boot behavior was a recurring source of confusion in the project. The current implementation, rather than earlier comments or session notes, is the reference:
 
@@ -507,7 +507,7 @@ talosctl --nodes <node-ip> version --client=false
 talosctl --nodes <control-plane-ip> service etcd status
 ```
 
-## Reference notes
+## 📚 Reference notes
 
 These files preserve the learning process and may contain older versions, local paths, or incomplete instructions. Cross-check them against the current script and provider schema rather than treating them as a deployment checklist.
 
