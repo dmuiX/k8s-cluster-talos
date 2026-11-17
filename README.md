@@ -1,8 +1,15 @@
 # ☸️ k8s-cluster-talos
 
-Fully automated Talos Linux Kubernetes cluster on KVM/libvirt — one script, zero manual steps.
+Talos Linux Kubernetes provisioning on KVM/libvirt, orchestrated with Bash and Terraform: from VM creation and machine configuration to Cilium networking and a GitOps handoff.
 
-Terraform provisioning → Cilium CNI → FluxCD GitOps → Cloudflare DNS → Longhorn storage → OpenBao secrets
+This repository and **[dmuiX/fluxcd.k8sdev.cloud](https://github.com/dmuiX/fluxcd.k8sdev.cloud)** are two parts of the same cluster project:
+
+- **Here — provisioning and bootstrap:** create the VMs, install Talos, initialize Kubernetes, and bring up the networking needed for GitOps.
+- **Companion repository — steady-state GitOps:** reconcile the cluster services and workloads after bootstrap, including the Longhorn and OpenBao dependencies expected by this script.
+
+> **Status:** an earlier learning/reference cluster, not a claim of a currently running production platform or a freshly reproducible deployment. The tracked code contains environment-specific assumptions and unfinished paths. Review [configuration](#configuration-reference), [safety notes](#safety-and-cleanup), and [current limitations](#current-limitations) before using it on an isolated lab host.
+
+[Architecture](#architecture-and-bootstrap-flow) · [Prerequisites](#prerequisites) · [Preparation](#preparation) · [Troubleshooting](#troubleshooting) · [Reference notes](#reference-notes)
 
 ## 🤔 Why Talos? Why a single bash script?
 
@@ -14,226 +21,195 @@ This cluster is the result of multiple failed attempts at on-prem Kubernetes:
 4. **Oracle Cloud free tier** — free VMs were never actually available
 
 **Why Talos?**
-Talos is an immutable, API-driven OS built specifically for Kubernetes — no SSH, no package manager, no drift. It brings everything out of the box: etcd, kubelet, containerd, all pre-configured. Upgrades are a single `talosctl upgrade` command — no apt, no reboots into broken states. Compared to provisioning Ubuntu/Debian nodes and manually bootstrapping Kubernetes on top, Talos removes an entire layer of complexity.
+Talos is an immutable, API-driven OS built specifically for Kubernetes — without SSH or a general-purpose package manager. It manages components such as etcd, kubelet, and containerd, removing much of the node configuration needed with general-purpose Linux. Configuration and upgrades use `talosctl`; compatibility, backups, and post-upgrade checks still matter.
 
 **Why one bash script instead of Ansible?**
-Ansible adds abstraction that gets in the way when you're bootstrapping a cluster from scratch. You end up writing playbooks that shell out to `talosctl` and `terraform` anyway — at that point, just use bash directly. One script, linear flow, easy to debug with `bash -x`. The script auto-detects what's already done and skips completed phases, so it's idempotent without the Ansible overhead.
+For this learning project, a single script keeps the sequence of `talosctl`, `terraform`, and Kubernetes CLI operations visible in one place. Named phase functions and retry helpers make the bootstrap process easier to trace. Some existing resources are detected and skipped, but that is not a guarantee of safe, idempotent reruns. Debug tracing can also expose credentials.
 
-## 🧱 Stack
+## Stack
 
-| Component               | Version              | Role                                      |
-| ----------------------- | -------------------- | ----------------------------------------- |
-| Talos Linux             | v1.11.2              | Immutable node OS                         |
-| Kubernetes              | v1.34.1              | Orchestration                             |
-| KVM/libvirt + Terraform | —                    | VM provisioning                           |
-| HAProxy                 | Ubuntu cloud-init    | API load balancer (`<haproxy-ip>:6443`)   |
-| Cilium                  | 1.18.2               | CNI, kube-proxy replacement, Gateway API  |
-| ArgoCD                  | v3.0.19              | GitOps (optional)                         |
-| FluxCD                  | latest               | GitOps (optional)                         |
-| OpenBao                 | via FluxCD           | Secrets management (optional)             |
-| Cloudflare              | Terraform provider v5| DNS (optional, `--skip-cloudflare`)       |
+| Component | Responsibility |
+| --- | --- |
+| KVM/libvirt + Terraform | qcow2 disks, bridged Talos VMs, deterministic MAC addresses |
+| Talos Linux + Kubernetes | Node OS, control plane, and API virtual IP (`VIRTUAL_IP:6443`) |
+| Cilium | CNI, kube-proxy replacement, L2 announcements, and Gateway API support; uses KubePrism on port `7445` |
+| FluxCD | Default GitOps handoff to the companion repository |
+| ArgoCD | Retained alternative installation function and Application example; see [GitOps choices](#gitops-choices) |
+| Cloudflare | Optional Terraform-managed node DNS records; separate in-cluster DNS/certificate credentials for Flux |
+| Longhorn + OpenBao | GitOps-managed storage and secrets services; optional OpenBao initialization here |
 
----
+There is no single version table: Talos/Cilium inputs come from local configuration, some manifests use fixed versions or `latest`, and other services come from GitOps. Check [provider constraints](vms/provider.tf), [machine patches](templates/), and [script inputs](bootstrap-cluster.sh) together before choosing compatible releases.
 
-## ✅ Prerequisites
+## Prerequisites
 
-- **KVM/libvirt** installed and running (`systemctl status libvirtd`)
-- **Bridge network** configured on the host (e.g. `br0`) — the script auto-detects the first bridge
-- **Cloudflare API token** with DNS edit permission (skip with `--skip-cloudflare`)
+- **An x86-64 Linux KVM host** with libvirt running, permission to use `virsh`, and a usable `default` storage pool. The preflight installer assumes an apt-based host and root or `sudo` access; this is not a portable macOS/Windows launcher.
+- **A LAN bridge with DHCP** for Talos maintenance-mode discovery, plus unused static node addresses and a control-plane virtual IP on the same network. The VM phase selects the first bridge returned by `ip`; verify that selection on hosts with multiple bridges.
+- **Enough RAM and disk space** for all VMs, Talos extensions, and workloads; see [memory planning](#memory-planning).
+- **Working CLI tools:** `kubectl`, Mike Farah `yq` v4, `jq`, `curl`, `openssl`, `arp-scan`, `talosctl`, `terraform`, `helm`, `virsh`, and GNU utilities such as `sha256sum`, `md5sum`, `join`, and `timeout`. Flux/Cilium CLIs are needed for their respective phases. The script attempts to install some missing tools, but uses `kubectl` before its late fallback installer; do not rely on a clean-host dependency setup.
+- **Network access** to image releases, Talos Image Factory, package repositories, GitHub, and container registries. Bootstrap downloads tools/manifests; it is not an offline workflow.
+- **Credentials for the paths you use:** Cloudflare for node DNS; GitHub and application credentials for the default Flux path. See [configuration](#configuration-reference) and [GitOps choices](#gitops-choices).
 
-Everything else (`talosctl`, `terraform`, `kubectl`, `helm`, `flux`, `cilium`, `yq`, `jq`, `arp-scan`, `genisoimage`, `openssl`) is installed by the script if missing.
+Review host-specific assumptions in [vms/nodes.tf](vms/nodes.tf) and both [Talos patches](templates/) as well: fixed CPU topology/`topoext`, AMD microcode in the generated schematic, `/24` node addresses, time servers, and reserved hugepages are not universal defaults.
 
----
+## Preparation
 
-## 🚀 Quick Start
+1. Read [bootstrap-cluster.sh](bootstrap-cluster.sh), the [Terraform inputs](vms/variables.tf), and the [safety notes](#safety-and-cleanup). This is a reference implementation, not a copy-and-run deployment contract.
+2. Create a private, shell-syntax **`.env`** at the repository root using the [configuration reference](#configuration-reference). There is **no tracked `.env.example`**. The script sources `.env` as Bash, so only use trusted contents. Its interactive prompt covers a subset of the required inputs, not a complete configuration wizard.
+3. Choose a control-plane/worker layout and compatible image/component versions. Keep the downloaded ISO path and Terraform's ISO input aligned; do not use the historical `haproxy` entry in `nodes.yaml.example` for the current flow.
+4. Choose whether to use Flux and OpenBao. Both phases are enabled by default. Skipping Flux without also skipping OpenBao leaves initialization waiting for Flux-managed resources.
+5. Back up existing libvirt/Terraform state, cluster credentials, and any persistent data before running against an existing environment.
 
-```bash
-# 1. Configure
-cp .env.example .env && vi .env
-
-# 2. Deploy
-./bootstrap-cluster.sh
-
-# 3. Verify
-kubectl get nodes
-cilium status
-```
-
-If `.env` is missing or incomplete, the script prompts for required values interactively.
-
----
-
-## 🗺️ Topology
-
-Defined entirely in `.env` — the script generates `nodes.yaml` automatically:
+For a **reviewed, disposable lab** with configuration already supplied, this example omits Cloudflare records, Flux, and OpenBao:
 
 ```bash
-CP_COUNT=3              # Control plane nodes (must be odd for etcd quorum)
-CP_MEMORY_MIB=8192      # RAM per CP node
-CP_VCPUS=4              # vCPUs per CP node
-CP_DISK_GIB=120         # Disk per CP node (qcow2)
-
-WORKER_COUNT=0           # Worker nodes (0 = workloads run on CPs)
-# WORKER_MEMORY_MIB=6144 # Only needed if WORKER_COUNT > 0
-# WORKER_VCPUS=4
-# WORKER_DISK_GIB=255
-
-HAPROXY_IP="192.168.1.20"
-CP_BASE_IP="192.168.1.21"    # CPs get .21, .22, .23, ...
-WORKER_BASE_IP="192.168.1.31" # Workers get .31, .32, ...
-GATEWAY="192.168.1.1"
-NAMESERVERS="192.168.1.253,192.168.1.1"
+./bootstrap-cluster.sh --skip-cloudflare --skip-fluxcd-installation --skip-init-openbao --no-cleanup
 ```
 
-When `WORKER_COUNT=0`, the script automatically enables `allowSchedulingOnControlPlanes` so workloads run directly on the control plane nodes. Override with `ALLOW_SCHEDULING_ON_CONTROL_PLANES=true|false` in `.env`.
+This still creates VMs and changes the cluster. **`--no-cleanup` is not a universal destruction guard:** the Terraform failure branch still calls `terraform destroy`. Terraform may also request Cloudflare inputs even with DNS disabled; see [current limitations](#current-limitations).
 
----
-
-## 💾 Memory Planning
-
-> **QEMU reserves the full assigned RAM per VM on the host**, regardless of actual guest usage.
-> The host OOM-killer will terminate QEMU processes when total allocations exceed available host RAM — even if VMs internally show low usage (e.g. 1.5 GiB used out of 8 GiB).
-
-> **Usable host RAM < physical RAM.** GPU VRAM (iGPU/shared), kernel, and BIOS reservations reduce it.
-> Example: 32 GiB physical − 4 GiB GPU VRAM = only ~23 GiB usable. Reduce GPU to 512 MiB in BIOS if not actively used → reclaims ~3.5 GiB.
-
-### With 4 GiB GPU VRAM (~27.5 GiB usable)
-
-| Setup                            | VM RAM    | Headroom   | Status                   |
-| -------------------------------- | --------- | ---------- | ------------------------ |
-| 3 CP (8G) + HAProxy             | 24.8 GiB  | ~2.7 GiB   | works                    |
-| 3 CP (5G) + 2 W (5G) + HAProxy  | 25.8 GiB  | ~1.7 GiB   | OOM during FluxCD deploy |
-| 3 CP (5G) + 2 W (6G) + HAProxy  | 27.8 GiB  | −0.3 GiB   | OOM                      |
-| 3 CP (6G) + 2 W (6G) + HAProxy  | 30.8 GiB  | −3.3 GiB   | OOM                      |
-
-### With 512 MiB GPU VRAM (~30.7 GiB usable)
-
-| Setup                            | VM RAM    | Headroom   | Status      |
-| -------------------------------- | --------- | ---------- | ----------- |
-| 3 CP (7G) + HAProxy             | 21.8 GiB  | ~8.9 GiB   | safe        |
-| **3 CP (8G) + HAProxy**         | 24.8 GiB  | ~5.9 GiB   | recommended |
-| 3 CP (9G) + HAProxy             | 27.8 GiB  | ~2.9 GiB   | max config  |
-| 3 CP (5G) + 2 W (5G) + HAProxy  | 25.8 GiB  | ~4.9 GiB   | untested    |
-| 3 CP (5G) + 2 W (6G) + HAProxy  | 27.8 GiB  | ~2.9 GiB   | untested    |
-| 3 CP (6G) + 2 W (6G) + HAProxy  | 30.8 GiB  | −0.1 GiB   | OOM         |
-
-> **Recommendation:** 3 CPs without separate workers on 32 GiB hosts. 5 VMs don't fit reliably.
-
----
-
-## 🔑 `.env` Variables
+After deployment, check the intended kubeconfig context before inspecting resources:
 
 ```bash
-CLUSTER_NAME=k8sdev
-BRIDGE_NAME=br0
-
-# --- Cluster Topology (see above) ---
-CP_COUNT=3
-CP_MEMORY_MIB=8192
-CP_VCPUS=4
-CP_DISK_GIB=120
-WORKER_COUNT=0
-HAPROXY_IP="192.168.1.20"
-CP_BASE_IP="192.168.1.21"
-GATEWAY="192.168.1.1"
-NAMESERVERS="192.168.1.253,192.168.1.1"
-
-# Download URLs
-
-# TALOS
-TALOS_VERSION="1.12.6"
-TALOS_ISO_URL="https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/metal-amd64.iso"
-TALOS_CHECKSUM_URL="https://github.com/siderolabs/talos/releases/download/v${TALOS_VERSION}/sha256sum.txt"
-METALISO_ABSOLUTE_PATH="${VMS_DIR}/metal-amd64.iso"
-
-# Ubuntu
-UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/resolute/20260328/resolute-server-cloudimg-amd64.img"
-UBUNTU_CHECKSUM_URL="https://cloud-images.ubuntu.com/resolute/20260328/SHA256SUMS"
-UBUNTU_IMAGE_PATH="/var/lib/libvirt/images/resolute-server-cloudimg-amd64.img"
-
-# Cilium / Gateway API
-CILIUM_VERSION="1.19.2"
-GATEWAY_API_VERSION="v1.4.0"
-
-# Terraform / Cloudflare (optional with --skip-cloudflare)
-TF_VAR_cloudflare_api_token=...
-TF_VAR_cloudflare_zone_name=...
-
-# FluxCD (optional)
-GITHUB_REPO_OWNER=...
-GITHUB_REPO=...
-GITHUB_TOKEN=...
-CLOUDFLARE_API_TOKEN=...
-
-OPENBAO_UNSEAL_KEY=...
-GRAFANA_USER="admin"
-GRAFANA_PASSWORD=...
+kubectl config current-context
+kubectl get nodes -o wide
+kubectl get pods -A
+cilium status --namespace cilium
 ```
+
+## Topology
+
+The script regenerates **`nodes.yaml`** from `.env` topology inputs before its main phases, including on detected-cluster reruns. Treat that file as generated output, not the durable place to edit topology. [nodes.yaml.example](nodes.yaml.example) illustrates an older layout and still includes HAProxy; it is not an exact template for current bootstrap.
+
+- `CP_COUNT`, `CP_BASE_IP`, `CP_MEMORY_MIB`, `CP_VCPUS`, `CP_DISK_GIB`: control-plane count, first IP, and resources. An odd control-plane count is the usual etcd quorum layout.
+- `WORKER_COUNT`, `WORKER_BASE_IP`, `WORKER_MEMORY_MIB`, `WORKER_VCPUS`, `WORKER_DISK_GIB`: optional workers. Worker base IP is needed when the count is greater than zero.
+- `VIRTUAL_IP`, `GATEWAY`, `NAMESERVERS`: control-plane VIP, default gateway, and comma-separated DNS servers. IP generation increments the last IPv4 octet; patches currently use `/24` addresses.
+
+With `WORKER_COUNT=0`, the script enables `allowSchedulingOnControlPlanes`. Override with `ALLOW_SCHEDULING_ON_CONTROL_PLANES=true|false` in `.env`. Actual schedulability also depends on workload taints, affinity, and resources.
 
 ---
 
-## ⚙️ Options
+## Memory planning
+
+Budget for **the sum of configured guest RAM plus host/QEMU overhead**, rather than assuming low pod usage makes overcommit safe. QEMU's resident memory depends on guest activity and allocation settings; it is not universally equal to the configured maximum.
+
+For example, three control planes at `8192` MiB each configure **24 GiB of guest RAM**, before host services and VM overhead. That is a planning example, not a tested capacity guarantee. Separate workers add their full memory budgets; a control-plane-only lab can avoid that overhead.
+
+Check actual host-available memory, iGPU/shared-memory reservations, and workload peaks. The Talos patches also reserve hugepages, reducing guest memory available to ordinary workloads. Host OOM kills can terminate VMs even when individual pods appear healthy.
+
+---
+
+## Configuration reference
+
+`.env` values are exported when sourced. Use quoted shell assignments and keep credentials private. This table describes inputs, not a ready-to-run configuration.
+
+| Inputs | Purpose / caveat |
+| --- | --- |
+| `CLUSTER_NAME` | Name passed to `talosctl gen config` |
+| Topology variables [above](#topology) | Counts, resources, addresses, DNS, and optional scheduling override |
+| `TALOS_VERSION` | Installer version **without** the leading `v`; both patches add it to the factory image tag |
+| `TALOS_ISO_URL`, `TALOS_CHECKSUM_URL` | Select matching release-specific ISO and checksum URLs; the checksum fallback points to `latest`, not necessarily the chosen ISO |
+| `METALISO_ABSOLUTE_PATH` | Download destination; defaults to the repository's `vms/metal-amd64.iso` |
+| `CILIUM_VERSION` | Version passed to `cilium install`; no script default |
+| `TF_VAR_libvirt_uri` | Explicit libvirt connection URI, typically `qemu:///system`; the variable has no declared default |
+| `TF_VAR_metaliso_absolute_path` | Absolute ISO path used by Terraform; must match the downloaded file and be readable by libvirt. Not automatically exported from `METALISO_ABSOLUTE_PATH` |
+| `TF_VAR_github_owner` | Currently declared as a required Terraform input, although unused in VM resources |
+| `TF_VAR_cloudflare_api_token`, `TF_VAR_cloudflare_zone_name` | Node DNS configuration; see the skip-path limitation below |
+| `GITHUB_REPO_OWNER`, `GITHUB_REPO`, `GITHUB_TOKEN` | Default Flux bootstrap: intended GitHub owner/repository and token with permission to write bootstrap manifests |
+| `CLOUDFLARE_API_TOKEN`, `GRAFANA_USER`, `GRAFANA_PASSWORD` | Required by the Flux phase to create the companion stack's initial Kubernetes Secrets; distinct from Terraform's Cloudflare input |
+| `OPENBAO_UNSEAL_KEY` | Set to an existing static unseal key, or explicitly to an empty string for first-time generation. The helper reads it under `set -u` |
+| `ARGOCD_VERSION`, `GATEWAY_API_VERSION` | Used by the retained ArgoCD function, if invoked; not defaults for all cluster manifests |
+
+The script derives `VMS_DIR`, `CLUSTER_DIR`, and `NODES_FILE_PATH` from its own location; do not override them in `.env`. It exports `TF_VAR_nodes_file_path` and `TF_VAR_bridge_name` during VM creation. The latter comes from bridge auto-detection, which overwrites a configured `BRIDGE_NAME` in that phase.
+
+Treat `.env`, `cluster/`, generated machine configs, kubeconfigs, Terraform state, and `openbao-credentials.txt` as sensitive. Keep keys and recovery material backed up outside the cluster and out of terminal/session recordings. See [current limitations](#current-limitations) for version and rerun caveats.
+
+---
+
+## Options
 
 ```text
 ./bootstrap-cluster.sh [OPTIONS]
 
-  --skip-iso-download         Skip ISO downloads (already present)
+  --help                      Show the script's help text
+  --skip-iso-download         Skip the Talos ISO download
   --skip-terraform            Skip VM creation (VMs already exist)
   --skip-config-creation      Skip Talos config generation
   --skip-bootstrap            Skip cluster bootstrap (cluster already running)
   --skip-cilium-installation  Skip Cilium
-  --skip-argocd-installation  Skip ArgoCD
-  --skip-fluxcd-installation  Skip FluxCD
-  --skip-init-openbao         Skip OpenBao initialization
-  --skip-cloudflare           Skip Cloudflare DNS (no API token needed)
+  --skip-argocd-installation  Skip ArgoCD (already the default)
+  --skip-fluxcd-installation  Skip FluxCD (enabled by default)
+  --skip-init-openbao         Skip OpenBao initialization (enabled by default)
+  --skip-cloudflare           Disable Terraform-managed Cloudflare node DNS records
 
-  --debug                     Enable bash -x tracing
-  --no-cleanup                Disable automatic cleanup on error
-  --cleanup-vms               Destroy VMs only (keep DNS)
-  --cleanup-all               Destroy everything (VMs + DNS)
+  --debug                     Enable bash tracing + pipefail; may expose credentials
+  --no-cleanup                Disable the exit-trap cleanup, not every destroy path
+  --cleanup-vms               Delete generated-topology VMs and their storage; keep DNS
+  --cleanup-all               Terraform destroy + deletion of local Talos configs/secrets
 ```
 
 ---
 
-## 🔄 Bootstrap Flow
+## Architecture and bootstrap flow
 
 ```text
-bootstrap-cluster.sh
-  ├─ credentials_prompt       Ask for missing .env vars interactively
-  ├─ phase_preflight          Install tools: talosctl, yq, jq, arp-scan, terraform, helm
-  ├─ phase_download_images    Download Talos ISO + Ubuntu cloud image (SHA256 verified)
-  ├─ phase_create_vms         terraform apply → KVM VMs + Cloudflare DNS
-  ├─ phase_generate_configs   talosctl gen config + node-specific patches
-  ├─ phase_bootstrap
-  │   ├─ Wait for HAProxy on :6443
-  │   ├─ arp-scan → discover DHCP IPs → match to MACs
-  │   ├─ Apply configs (talosctl apply-config --mode=reboot)
-  │   ├─ Set boot order: disk first, ISO fallback
-  │   ├─ Wait for first CP → talosctl bootstrap (etcd init)
-  │   ├─ Wait for remaining CPs + workers to join
-  │   └─ Retrieve kubeconfig
-  ├─ phase_install_cilium     Cilium CNI (KubePrism, Gateway API)
-  ├─ phase_install_argocd     ArgoCD HA mode (optional)
-  ├─ phase_install_fluxcd     flux bootstrap github (optional)
-  ├─ phase_cleanup_temp       Remove temporary node-config files
-  ├─ phase_init_openbao       Initialize OpenBao with auto-unseal (optional)
-  └─ print_summary
+.env → generated nodes.yaml → Terraform → Talos VMs on a LAN bridge
+                                             │
+                     DHCP discovery + MAC matching → per-node static config
+                                             │
+                    Kubernetes bootstrap → API at VIRTUAL_IP:6443
+                                             │
+                      Cilium → Flux bootstrap → companion GitOps repository
+                                                   │
+                                      cluster services and workloads
 ```
 
-The script auto-detects an existing cluster and skips phases that are already done.
+The phase functions in [bootstrap-cluster.sh](bootstrap-cluster.sh) make the sequence explicit:
 
----
+```text
+credentials_prompt           Prompt for a subset of missing inputs
+phase_preflight              Check/install some CLI dependencies
+phase_download_images        Download the Talos ISO; attempt checksum verification
+phase_create_vms              Terraform init/apply: disks, VMs, optional node DNS
+phase_generate_configs       Generate/reuse secrets; patch configs per node
+phase_bootstrap              Discover DHCP IPs; apply configs in parallel; eject CP ISOs
+                             Wait for a control plane; bootstrap etcd; fetch kubeconfig
+phase_install_cilium         Install networking with KubePrism on localhost:7445
+phase_install_argocd         Retained HA installation path; skipped by default
+phase_install_fluxcd         Create initial Secrets; flux bootstrap github
+phase_cleanup_temp           Remove temporary node-config patches
+phase_init_openbao           Wait for Flux dependencies; create unseal Secret; initialize
+print_summary                Print a summary (verify actual health separately)
+```
 
-## Why is cilium in script and also in the fluxcd repo?
+The machine patches disable the default CNI and kube-proxy and include extra manifests for metrics-server, kubelet certificate approval, and Gateway API. **Cilium is installed before Flux** because nodes need networking before the GitOps controllers can run. The companion GitOps configuration then provides the steady-state management layer; align its Cilium values and ownership with the bootstrap installation.
 
-its necessary for the nodes to become ready and to get fluxcd running.
-and in fluxcd repo well its easier to update that way ;).
-so yeah its redundant but its necessary!
+The Kubernetes API uses the Talos VIP configured in the control-plane patch. **Current Terraform does not provision HAProxy, an Ubuntu image, or XSLT tuning files.** Those references in older notes describe an earlier design; VM tuning is now native HCL in [vms/nodes.tf](vms/nodes.tf).
 
-## ⬆️ Upgrade Talos
+Existing-cluster detection checks for local credentials and a successful `kubectl get nodes`, then skips selected phases. It is not a comprehensive check of cluster identity, health, or workload readiness; verify your kubeconfig context before rerunning.
+
+## GitOps choices
+
+- **Flux (default):** uses `GITHUB_REPO_OWNER` / `GITHUB_REPO`, branch `main`, path `clusters`, token authentication, `--personal`, and `--private=true`. It writes bootstrap manifests to GitHub and reconciles them in the cluster. Adapt these assumptions before using another repository layout or an organization. See the [companion repository](https://github.com/dmuiX/fluxcd.k8sdev.cloud) and [historical Flux notes](fluxcd/fluxcd.md).
+- **ArgoCD (retained alternative):** the script contains an HA install function, but initializes its skip flag to `true` and has **no CLI enable switch**. The [Application example](argocd/deployment.yml) points to a separate `argocd.k8sdev.cloud` repository and contains a `${GITHUB_REPO_OWNER}` placeholder that needs rendering; plain `kubectl apply` does not expand it. Installation and repository credentials need separate review. [ArgoCD notes](docs/argocd.md) document earlier experiments, not the default workflow.
+- **Neither:** use `--skip-fluxcd-installation --skip-init-openbao` to stop before those steps. ArgoCD is already skipped. Install and manage the remaining platform services separately.
+- **Cloudflare is two separate paths:** `--skip-cloudflare` disables Terraform node DNS records, not the Flux phase's Cloudflare Secrets for cert-manager/external-dns. The default Flux path still requires `CLOUDFLARE_API_TOKEN`.
+
+OpenBao initialization assumes the companion stack exposes HelmReleases named `cilium`, `cert-manager`, `longhorn`, and `openbao` in `flux-system`, plus an `openbao-0` pod. It does not install those services itself. The helper prints sensitive key/initialization output and writes root/recovery credentials to `openbao-credentials.txt`; protect and back up that material.
+
+### OpenBao reruns
+
+**Do not rerun the OpenBao phase with the first-install `OPENBAO_UNSEAL_KEY=""` setting.** The helper generates a new key and applies the unseal Secret **before** checking whether OpenBao is already initialized. Existing-cluster detection does not skip this phase. Replacing the key can prevent automatic unsealing after a restart.
+
+Before a rerun, preserve the original generated key in protected private configuration and independently backed-up recovery custody, or pass `--skip-init-openbao`. Do not generate a replacement key as a troubleshooting step for an initialized instance.
+
+## Upgrade reference
+
+Upgrades are a separate maintenance operation, not a guaranteed bootstrap feature. Check the [Talos documentation](https://docs.siderolabs.com/) for the supported source/target path and client compatibility. Back up etcd, persistent volumes, and recovery credentials first; plan for quorum and storage replica health. [Earlier upgrade notes](docs/upgrade-cluster.md) record Longhorn trouble, not a validated upgrade runbook.
+
+Preserve the system extensions needed by the workloads. The current bootstrap requests this schematic (the AMD microcode extension is host-specific):
 
 ```bash
-# 1. Generate schematic ID with required extensions
+# Generate a schematic ID for the extensions used by this lab
 curl -sX POST "https://factory.talos.dev/schematics" \
   -H "Content-Type: application/yaml" \
   --data-binary @- <<'EOF' | jq -r '.id'
@@ -245,63 +221,54 @@ customization:
     - siderolabs/util-linux-tools
     - siderolabs/iscsi-tools
 EOF
-
-# 2. Upgrade all nodes
-export TALOSCONFIG=./cluster/talosconfig
-talosctl -n <cp-1>,<cp-2>,<cp-3> \
-  upgrade --image factory.talos.dev/installer/<schematic-id>:v1.11.2 \
-  --preserve --wait=false
 ```
+
+For a reviewed maintenance plan, the command shape for **one node at a time** is:
+
+```bash
+export TALOSCONFIG=./cluster/talosconfig
+talosctl --nodes <one-node-ip> upgrade \
+  --image factory.talos.dev/installer/<schematic-id>:v<target-version> \
+  --preserve
+```
+
+Replace the placeholders, verify the target release's CLI semantics, and check node, etcd, and storage health before proceeding to another node. `--preserve` is not a backup or a guarantee against data loss. Kubernetes upgrades require their own compatibility review.
 
 ---
 
-## 📁 File Structure
+## File structure
 
 ```text
 bootstrap-cluster.sh          Main orchestration script
-.env                          Credentials + topology (gitignored)
-nodes.yaml                    Auto-generated from .env (gitignored)
-templates/                    Talos machine config patches (control + worker)
-vms/                          Terraform: KVM domains, HAProxy, Cloudflare DNS
-  ├─ optimizations.xsl        VM tuning: IOThreads, CPU, on_crash: restart
-  └─ optimizations_haproxy.xsl  HAProxy-specific VM tuning
-cluster/                      Generated Talos configs (gitignored)
-argocd/                       ArgoCD Application manifest
-fluxcd/                       FluxCD bootstrap config
-scripts/                      Helper scripts (boot order, YAML validation)
-docs/                         Component docs (Cilium, Longhorn, ArgoCD, ...)
+.env                          Local shell configuration + credentials (gitignored)
+nodes.yaml                    Generated topology (gitignored)
+nodes.yaml.example            Historical topology example, including old HAProxy node
+templates/                    Talos control-plane and worker patches
+vms/                          Terraform: KVM domains, disks, optional Cloudflare DNS
+cluster/                      Generated Talos configs and secrets (gitignored)
+argocd/                       Alternative Application example + Gateway API manifest
+fluxcd/                       Earlier standalone Flux bootstrap notes/helper
+scripts/                      Boot-order and YAML tooling helpers (review before use)
+docs/                         Component notes and troubleshooting history
+docs/archive/                 Earlier plans and session notes
 ```
 
 ---
 
-## 🧹 Cleanup
+## Safety and cleanup
 
-```bash
-# Remove VMs only (keep Cloudflare DNS)
-./bootstrap-cluster.sh --cleanup-vms
+**Cleanup destroys data.** Read the implementation and confirm VM names, storage, Terraform state, and backups before using either flag:
 
-# Remove everything (VMs + DNS records)
-./bootstrap-cluster.sh --cleanup-all
-```
+| Path | Actual behavior |
+| --- | --- |
+| `--cleanup-vms` | Reads names from `nodes.yaml`, calls `virsh destroy` and `virsh undefine --remove-all-storage`. Keeps DNS and does not reconcile Terraform state. There is no confirmation prompt in this helper |
+| `--cleanup-all` | Runs `terraform destroy` in `vms/`, then deletes local generated Talos configs **including `secrets.yaml`** |
+| Exit after an error | Normally asks whether to clean up; confirmation invokes VM-only deletion and removes some generated configs |
+| `--no-cleanup` | Disables that exit trap's cleanup; **does not** bypass the `terraform destroy` call after a failed `terraform apply` |
 
----
+These operations are broader than a Kubernetes reset. Store recovery material outside the affected VMs and repository checkout. Do not use a rerun or cleanup flag as the first diagnostic step for a valuable cluster.
 
-## 📦 ArgoCD Deployment Order
-
-When deploying via ArgoCD, install in this order:
-
-1. Kubernetes (base cluster)
-2. Cilium
-3. external-dns
-4. cert-manager
-5. ArgoCD
-6. external-secrets
-7. gateway-api
-8. argocd-apps
-
----
-
-## 🐛 Troubleshooting
+## Troubleshooting
 
 Most cluster issues fall into a few categories:
 
@@ -322,7 +289,7 @@ Common on CP-only clusters: HelmCharts set `nodeAffinity` with `node-role.kubern
 
 ### Pod in `CrashLoopBackOff`
 
-Container starts, crashes, Kubernetes retries with increasing backoff (10s → 20s → 40s → ...).
+The container repeatedly exits and Kubernetes backs off before restarting it. Inspect the previous container's logs and termination reason.
 
 ```bash
 kubectl logs <pod-name> --previous    # logs from the last crash
@@ -339,31 +306,27 @@ Common causes:
 
 ### Host OOM kills QEMU VMs
 
-VMs shut off randomly even though guest memory usage is low. QEMU reserves the full assigned RAM regardless of guest usage.
+If VMs stop unexpectedly, confirm whether the host OOM-killer terminated QEMU. Low guest-reported usage alone does not establish that the host has enough memory.
 
 ```bash
-dmesg | grep -i oom                   # confirm OOM kill
+dmesg | grep -i oom
+free -h
+virsh list --all
 ```
 
-Enable **KSM** (Kernel Same-page Merging) to deduplicate identical memory pages across VMs — especially effective with multiple Talos nodes running the same kernel:
-
-```bash
-echo 1 | sudo tee /sys/kernel/mm/ksm/run                                        # activate
-cat /sys/kernel/mm/ksm/pages_sharing                                             # check effect
-echo "w /sys/kernel/mm/ksm/run - - - - 1" | sudo tee /etc/tmpfiles.d/ksm.conf   # persist
-```
+Reduce allocations or workloads and leave room for the host. **KSM** (Kernel Same-page Merging) can deduplicate identical pages on suitable hosts, but its effectiveness varies and it has performance/security trade-offs; it is not a substitute for a memory budget.
 
 ### GPU VRAM reduces usable host RAM
 
-iGPU / shared memory GPUs allocate VRAM from system RAM. 32 GiB physical with 4 GiB GPU = only ~23 GiB usable. Reduce to 512 MiB in BIOS if the GPU is not actively used → reclaims ~3.5 GiB.
+An integrated GPU may reserve system RAM in firmware. Compare installed RAM with the OS-visible amount before sizing the VMs; reducing an unused graphics reservation may reclaim memory. The exact amount is host-specific.
 
 ### Pod can't reach the internet
 
-DNS or firewall issue between pod and external network.
+Check DNS resolution, egress policy, routing, and the host firewall separately.
 
 ```bash
 kubectl exec -it <pod> -- wget -qO- https://example.com
-kubectl logs -n cilium -l app.kubernetes.io/name=cilium-agent | grep -i drop
+kubectl logs -n cilium -l k8s-app=cilium --tail=100
 ```
 
 Check: Cilium NetworkPolicies, CoreDNS running (`kubectl get pods -n kube-system`), host firewall not blocking bridge traffic (`sysctl net.bridge.bridge-nf-call-iptables`).
@@ -373,10 +336,10 @@ Check: Cilium NetworkPolicies, CoreDNS running (`kubectl get pods -n kube-system
 Typos, wrong encoding, or wrong namespace.
 
 ```bash
-kubectl get secret <name> -n <ns> -o jsonpath='{.data}' | jq 'to_entries[] | .value |= @base64d'
+kubectl describe secret <name> -n <ns>  # inspect key names/sizes, not decoded values
 ```
 
-Common mistakes: value not Base64-encoded, secret in wrong namespace, key name mismatch between secret and pod spec, extra newline (`echo -n` vs `echo`).
+Check namespace, key names referenced by the Pod, and accidental newlines. Kubernetes `data` values must be Base64-encoded; `stringData` accepts plain strings. Base64 is not encryption. Avoid copying secret values into logs or issue reports.
 
 ### Traffic not reaching pods
 
@@ -397,24 +360,31 @@ Check `spec.valuesFrom` references, chart version compatibility, and whether dep
 
 ---
 
-## ⚠️ Known Issues
+## Current limitations
 
-| Issue | Details |
-| ----- | ------- |
-| **Do not set `VMS_DIR` / `CLUSTER_DIR` / `NODES_FILE_PATH` in `.env`** | The script derives paths from `BASH_SOURCE[0]`. Setting these via `PWD=$(pwd)` caused them to resolve to `/` in subshells → configs in wrong directory → TLS cert mismatches. |
-| **Pin the Ubuntu image URL** | Don't use `current` — it pulls latest daily builds that can break (e.g. `gateway4` removed in netplan, stricter cloud-init schema). Use a specific dated build. |
-| **Terraform Cloud: Local Execution only** | The libvirt provider requires local execution. Remote execution fails with `dial unix /var/run/libvirt/libvirt-sock: no such file or directory`. |
-| **cloud-init must be single-line** | Multi-line cloud-init user data breaks with the libvirt Terraform provider. |
-| **`prevent_destroy` can't use variables** | `prevent_destroy = var.x` doesn't work in Terraform. Remove the block manually to toggle. |
-| **No Talos kernel params via libvirt** | Passing `kernel`/`cmdline` via the Terraform provider causes kernel panic on boot. |
-| **VM tuning via XSL, not Terraform** | IOThreads, CPU topology, crash behavior → edit `vms/optimizations.xsl`, not the `.tf` files. Referenced via `xml { xslt = ... }` in `nodes.tf`. |
-| **dmacvicar/libvirt 0.9.x drops the `<features>` block on q35 → no PCIe enumeration in guest** | See section below. Always set `features = { acpi = {}, apic = {} }` at the domain level in `nodes.tf`. |
+These are observations from the tracked code, not results of a fresh deployment test.
+
+| Area | Current state |
+| --- | --- |
+| Configuration completeness | No tracked `.env.example`; prompts cover only some inputs. `TALOS_VERSION`, `CILIUM_VERSION`, and several Terraform inputs need explicit configuration |
+| Cloudflare skip path | DNS resources are conditional, but `cloudflare_api_token` and `cloudflare_zone_name` remain required Terraform variables without defaults. `--skip-cloudflare` does not remove those declarations or the Flux credential requirement |
+| Terraform execution | No backend block is tracked. The configured libvirt URI must be reachable from the Terraform execution environment; `qemu:///system` uses the local host. Earlier Terraform Cloud notes are not current backend configuration |
+| Image verification | Existing ISO files are accepted without rechecking. A checksum-download failure warns and continues; independently verify the selected image/checksum pair before use |
+| Version selection | The machine patches contain fixed Gateway API URLs and moving `main`/`latest` URLs for other manifests. `GATEWAY_API_VERSION` only affects the ArgoCD function; it does not rewrite the patch URLs |
+| Host assumptions | First-bridge selection, a `default` storage pool, fixed CPU topology/`topoext`, AMD microcode, `/24` addressing, and lab time servers need review |
+| Reruns | Detection depends on local credentials/current Kubernetes context; topology is still regenerated. The Cilium install path can uninstall existing resources if not skipped. Preserve the original OpenBao unseal key or skip that phase; see [OpenBao reruns](#openbao-reruns) |
+| Partial failures | Some node/configuration/readiness failures warn and continue. The final summary does not prove all nodes, GitOps services, or storage are healthy |
+| Worker cold boots | Terraform attaches the ISO to all nodes; bootstrap's persistent ISO-ejection loop only visits control planes. Review worker media/boot behavior before relying on restarts |
+| Destructive error handling | A failed `terraform apply` invokes `terraform destroy` even with `--no-cleanup`; VM-only cleanup removes storage outside Terraform's state management |
+| Earlier design notes | HAProxy, Ubuntu cloud-init, and XSLT tuning references are historical. Current VM resources use native provider attributes, including explicit ACPI/APIC features |
+
+The detailed debugging and lifecycle notes below retain useful project history while distinguishing it from the current implementation.
 
 ---
 
-## 🐞 Debug Story: Talos VMs without network after the Terraform overhaul
+## Debug story: Talos VMs without network after the Terraform overhaul
 
-This one cost a full debug session. Writing it down so the next person (or the next overhaul) doesn't repeat it.
+A historical incident retained for its debugging method. The current HCL already includes explicit ACPI/APIC features; this is not a claim that all libvirt 0.9.x deployments have the same problem.
 
 ### Symptom
 
@@ -431,7 +401,7 @@ After the Terraform overhaul to `dmacvicar/libvirt ~> 0.9.7` (commit `fe42438`),
 | Tap device | `ip link show vnetXXX` | `UP, LOWER_UP, master br0` ✅ |
 | Bridge enslavement | `bridge link show` | tap is slave of `br0` ✅ |
 | Bridge / DHCP | Windows VM gets a lease on the same bridge | DHCP server reachable ✅ |
-| Generated XML interface block | `virsh dumpxml \| sed -n '/<interface/,/<\/interface>/p'` | `virtio`, `link state='up'`, valid `52:54:00:…` MAC ✅ |
+| Generated XML interface block | `virsh dumpxml <vm-name> \| sed -n '/<interface/,/<\/interface>/p'` | `virtio`, `link state='up'`, valid `52:54:00:…` MAC ✅ |
 | Host wire activity | `tcpdump -i br0 -e -nn ether host 52:54:00:…` during boot | **zero packets** — no ARP, no DHCP, no IPv6 RS ❌ |
 | MAC consistency | TF's `md5(name)` slicing vs. `bootstrap-cluster.sh:get_mac_for_node` | identical ✅ |
 | Bridge auto-detect picking the wrong bridge | `br0` is set in virt-manager, tap really is enslaved to it | not the cause ✅ |
@@ -439,15 +409,13 @@ After the Terraform overhaul to `dmacvicar/libvirt ~> 0.9.7` (commit `fe42438`),
 | Schematic | Used only later in the `installer` image string in [templates/control-node-patch.yaml](templates/control-node-patch.yaml), irrelevant for first boot | not the cause ✅ |
 | Talos really is running, on the right tab | Confirmed visually on VNC | yes ✅ |
 | Boot order edge cases (`cdrom,hd` falling through to a blank disk) | Talos dashboard is visible, so kernel is alive | not the cause ✅ |
-| q35 PCIe controller layout | `virsh dumpxml \| sed -n '/<controller/,/\/controller>/p'` | standard q35 with 6 auto-added `pcie-root-port`s, NIC behind `pci.1` — perfectly normal ✅ |
+| q35 PCIe controller layout | `virsh dumpxml <vm-name> \| sed -n '/<controller/,/\/controller>/p'` | q35 layout with auto-added `pcie-root-port`s and NIC behind `pci.1`; no obvious topology error ✅ |
 
-The killer fact: **`tcpdump` saw absolutely nothing on the wire**, while everything host-side and XML-side looked correct. That meant the guest itself wasn't bringing the NIC up — but Talos's stock ISO has virtio_net built into the kernel, so this should be impossible.
+The useful clue: **`tcpdump` saw no traffic from the guest**, while host-side checks looked correct. That shifted attention from DHCP configuration toward whether the guest could see the virtual NIC at all.
 
 ### The cross-OS sanity check that cracked it
 
-Booted **Alpine standard** in the same VM slot (Alpine has virtio_net in every variant — it's one of the most common KVM guests on the planet). Alpine **also** saw only `lo`. That definitively eliminated Talos as the cause: the guest kernel, *any* guest kernel, wasn't seeing a NIC.
-
-So the problem had to be in what qemu was actually exposing to the guest, not in any guest OS.
+Booting **Alpine standard** in the same VM slot also showed only `lo`. Reproducing the symptom with a second OS made a Talos-specific network configuration problem less likely and directed the investigation toward the virtual hardware.
 
 ### Root cause
 
@@ -461,13 +429,7 @@ Looking at the **complete** domain XML (not just the `<interface>` block), one e
 </features>
 ```
 
-On q35, **PCIe device enumeration in the guest goes through ACPI tables**. Without `<acpi/>`:
-
-- The guest sees the q35 chipset itself (LPC, integrated ICH9 SATA at bus `0x00` slot `0x1f` — that's how the boot CDROM still worked)
-- The guest **cannot enumerate any `pcie-root-port`** or anything behind one
-- That includes the virtio NIC at bus `0x01` and the virtio disk at bus `0x04`
-
-That's why the guest boots from the SATA CDROM (chipset-integrated, no ACPI needed) but never sees the virtio NIC. Windows happened to work because its VM was originally created via virt-manager which always sets `<features><acpi/><apic/></features>` by default.
+In this q35 setup, missing ACPI prevented the guest from enumerating devices behind the PCIe root ports, including the virtio NIC and disk. The chipset-integrated SATA CDROM still allowed the ISO to boot, making the failure look like a networking problem. The working Windows VM, created separately through virt-manager, had ACPI/APIC enabled.
 
 ### Why the old code was fine and the new code wasn't
 
@@ -476,25 +438,20 @@ That's why the guest boots from the SATA CDROM (chipset-integrated, no ACPI need
 | Provider | `dmacvicar/libvirt < 0.9` | `dmacvicar/libvirt ~> 0.9.7` (new framework schema) |
 | Machine type | not set → libvirt default `pc` (i440fx) | `q35` |
 | Tuning | `xml { xslt = optimizations.xsl }` | native attributes |
-| `<features>` in generated XML | present (libvirt auto-adds defaults when TF doesn't fight it) | **absent** |
+| `<features>` in generated XML | present in the earlier setup | **absent** in the failing setup |
 
-Two things have to coincide for this bug to bite:
-
-1. The provider's new framework schema generates a domain **without any `<features>` element**, which suppresses libvirt's normal auto-add of `<acpi/>`/`<apic/>`.
-2. The machine type is `q35`, where ACPI is mandatory for PCIe enumeration. On `pc`/i440fx the same missing-features block is mostly harmless because i440fx enumerates devices via legacy PCI mechanisms that don't strictly require ACPI.
-
-The overhaul changed both at once, so the regression was masked behind "everything changed, where do I even start".
+The migration changed the provider schema, machine type, and tuning representation together. Looking only at the interface block hid the missing domain-level features; comparing the complete domain XML was more useful.
 
 ### Fix
 
-Add an explicit `features` block at the domain level in [vms/nodes.tf](vms/nodes.tf):
+The explicit domain-level `features` block is already present in [vms/nodes.tf](vms/nodes.tf), using the current schema:
 
 ```hcl
 resource "libvirt_domain" "node_domain" {
   # ...
 
   features = {
-    acpi = {}
+    acpi = true
     apic = {}
   }
 
@@ -502,7 +459,7 @@ resource "libvirt_domain" "node_domain" {
 }
 ```
 
-Verify after `terraform apply` that the generated XML now contains:
+When reviewing a deployment, verify that its domain XML contains:
 
 ```xml
 <features>
@@ -511,49 +468,55 @@ Verify after `terraform apply` that the generated XML now contains:
 </features>
 ```
 
-After that, Talos sees the virtio NIC, DHCPs in maintenance mode, and `apply-config` can proceed normally.
+The project notes record that enabling these features restored NIC visibility and DHCP in the affected setup.
 
 ### Lessons
 
 - **When `dumpxml` looks "fine", check what's *missing*, not just what's there.** A missing `<features>` is invisible until you look for it specifically.
-- **A cross-OS boot test (Alpine in the same VM slot) is the cheapest way to partition guest-vs-host bugs.** Took 5 minutes, eliminated an entire hypothesis class.
-- **`tcpdump` returning zero packets is a *strong* signal**, not a "maybe filter wrong" signal. If host-side everything checks out and the wire is silent, the guest doesn't have the device — period.
+- **A cross-OS boot test helps separate guest-specific configuration from virtual hardware problems.** Reproducing the failure with Alpine narrowed the investigation.
+- **No packets is a useful clue, not proof on its own.** Validate the capture interface/filter and host bridge, then check whether the guest enumerates the device.
 - **When a Terraform provider migration changes more than one thing at once** (provider major version + machine type + schema style), expect at least one regression that hides behind the others.
 
 ---
 
-## Phase 7 bootstrap sequence — what actually happens and why
+## Phase 7 lifecycle: from ISO to installed Talos
 
-This section exists because Phase 7 has been "simplified" and re-broken several times. Each rewrite removed safeguards without understanding what they were defending against. Write down the real model once, here, so the next round of edits starts from facts instead of guesses.
+Boot behavior was a recurring source of confusion in the project. The current implementation, rather than earlier comments or session notes, is the reference:
 
-### The VM lifecycle from blank disk to running Talos
+1. **Initial boot:** [vms/nodes.tf](vms/nodes.tf) attaches the Talos ISO and sets `os.boot_devices` to CDROM then disk for all nodes. The blank-disk VM boots into maintenance mode with a DHCP address.
+2. **Discovery and installation:** `phase_bootstrap` matches Terraform's deterministic MAC outputs to `arp-scan` results. It applies per-node configs in parallel with `talosctl apply-config --insecure --mode=reboot` and retries failures. The patches select a factory installer image tagged `:v${TALOS_VERSION}` and configure static addresses; the current VM disk is `vda`.
+3. **Persistent media change:** after config application, the script runs `virsh change-media --eject ... --config` for **control planes only**. It does not call `virt-xml` or rewrite the boot order. Persistent media changes affect later starts; they are separate from the running guest's installation progress.
+4. **Secure endpoint checks:** the current **Phase 7.2 exists** and polls the control-plane static IPs with authenticated `talosctl version`. Later steps attempt etcd bootstrap, check additional nodes, and retrieve kubeconfig. API reachability alone is not full cluster health.
 
-1. **VMs are created with boot order `cdrom,hd`** ([vms/nodes.tf](vms/nodes.tf) — `boot_device { dev = ["cdrom", "hd"] }` for control nodes). Disk is blank, so BIOS falls through to the attached Talos ISO and boots into **maintenance mode**. Node comes up on a **DHCP** IP, reachable only via `talosctl --insecure`.
+Earlier project notes describe Talos transitioning with **kexec**, without a complete firmware reboot. That explains why waiting for a fixed number of libvirt power-state transitions was a poor readiness signal. It does **not** mean every `apply-config` return proves installation, reboot, and Kubernetes readiness have completed.
 
-2. **Phase 7.1** runs `talosctl apply-config --insecure --mode=reboot` in parallel against every node's DHCP IP. Two things happen inside Talos as a result:
-   - The machine config is written and the installer runs. The installer pulls the factory installer image (whose tag **must** have a `v` prefix — see commit `d3415a8`, this was the root cause of earlier "Phase 7.2 regressions") and writes Talos to `/dev/vda`.
-   - `--mode=reboot` **does not do a BIOS reboot**. Talos **kexecs** directly into the newly-installed kernel on disk. No firmware, no boot-order lookup, no ISO re-entry. The node transitions in one step from "maintenance on DHCP + `--insecure`" to "fully-installed Talos on its **static** IP with real PKI".
+### Diagnostic lessons
 
-3. **End of Phase 7.1**: a single `virt-xml --edit --boot hd,cdrom` per node updates the **persistent** libvirt XML from `cdrom,hd` to `hd,cdrom`. This is safe on a running VM — `virt-xml --edit` only touches persistent config, never the live instance. It takes effect on the next cold power-on (host reboot, manual `virsh destroy`/`start`, etc.) so future cold boots land on disk instead of falling back into the ISO.
+- If a node returns to maintenance mode, inspect the installer image tag, extensions, install disk, and installation result before blaming boot-order timing. The notes record a missing `v` prefix as one earlier cause; the current patches add that prefix.
+- Do not force-stop a node while installation may be writing to disk. Diagnose the actual endpoint and disk/media state first.
+- Check persistent XML as well as the running domain, especially for worker cold boots; the current ejection loop does not cover workers.
+- Use explicit readiness checks rather than arbitrary sleeps or assumptions about how many reboots should occur.
 
-4. **Phase 7.2** (formerly 7.3 — the old 7.2 has been deleted entirely) just waits for the first control node to become ready on its static IP, then bootstrap proceeds normally.
+Useful read-only checks (replace placeholders):
 
-### There is no Phase 7.2
+```bash
+virsh dumpxml <vm-name> --inactive
+virsh domblklist <vm-name> --details
+# With TALOSCONFIG pointing to this cluster:
+talosctl --nodes <node-ip> version --client=false
+talosctl --nodes <control-plane-ip> service etcd status
+```
 
-There used to be. It did some combination of: wait for "Reboot 1", wait for "Reboot 2", `virsh destroy`, change boot order, `virsh start`. **All of that was wrong.** The model it was built on ("apply-config causes two BIOS reboots we have to ride out") was never true — Talos kexecs. The node has already left the ISO by the time Phase 7.1 returns. A diagnostic run on 2026-04-07 confirmed this unambiguously: `talosctl --insecure` on the DHCP IP was `down` from t=0 on every node, and `domstate` stayed `running` the whole time. There was nothing to wait for, and nothing to race.
+## Reference notes
 
-### Why previous "Phase 7.2" rewrites kept breaking
+These files preserve the learning process and may contain older versions, local paths, or incomplete instructions. Cross-check them against the current script and provider schema rather than treating them as a deployment checklist.
 
-The real failure was one layer up: the factory installer image tag was missing its `v` prefix, so the **install itself failed**. With no bootloader on disk, there was nothing for kexec to jump into, so the VM fell back to the ISO and came up in maintenance again — looking exactly like "Phase 7.2 didn't change the boot order in time". Every rewrite added more waits and more `virsh destroy` dances trying to defend against a symptom whose cause lived in Phase 7.1's image tag. `d3415a8` fixed the real bug; after that, Phase 7.2 had nothing left to do, and its wait loops were pure dead time (~120s per node).
+- [Cilium notes](docs/cilium.md) — earlier networking experiments; the script contains the current bootstrap values.
+- [Longhorn notes](docs/longhorn.md) — Talos storage extensions, mounts, and Pod Security considerations.
+- [Upgrade notes](docs/upgrade-cluster.md) — maintenance experiments and storage/recovery lessons.
+- [No-network investigation](docs/debug-talos-no-network.md) — earlier hypotheses; the resolved historical case is summarized above.
+- [HAProxy notes](docs/haproxy.md) — the former Ubuntu/cloud-init design, no longer provisioned here.
+- [ArgoCD notes](docs/argocd.md) and [Flux notes](fluxcd/fluxcd.md) — alternative/earlier GitOps setup details.
+- [Archived plans and session notes](docs/archive/) — development history, not current operational guarantees.
 
-### Rules for anyone touching Phase 7 in the future
-
-- **Do not reintroduce wait-for-reboot loops in Phase 7.2.** Talos kexecs. There is no BIOS reboot to wait for. If nodes are coming up in maintenance mode after a bootstrap, the bug is in the install (image tag, config patch, disk layout) — not in boot-order timing.
-- **Do not `virsh destroy` / `virsh shutdown` nodes right after `apply-config`.** If you catch a node during the narrow window where the installer is still writing to disk, you leave a blank disk and the next boot falls back to the ISO. The kexec model means you don't need to power-cycle at all — the node is already running from disk.
-- **`virt-xml --edit --boot hd,cdrom` does not require a shutdown.** It edits persistent XML only. The live VM is untouched.
-- **Initial boot order in `vms/nodes.tf` must stay `cdrom,hd`.** That's how a blank disk reaches maintenance mode in the first place. Don't "simplify" it to `hd,cdrom` — the disk is empty on first boot and the VM will hang.
-- **If you're about to add a `sleep` or a polling loop to Phase 7, stop and read this section again.** The kexec happens synchronously from `talosctl apply-config`'s point of view: when that command returns, the install+kexec is already done. There is nothing to wait for.
-
-> AI-assisted development with [Claude Code](https://claude.ai/claude-code)
-
-Tested on Functionality: Works for now ;) until they change anything with talos or the rest.
+> AI-assisted development with Claude Code.
