@@ -2,12 +2,12 @@
 
 Talos Linux Kubernetes provisioning on KVM/libvirt, orchestrated with Bash and Terraform: from VM creation and machine configuration to Cilium networking and a GitOps handoff.
 
-This repository and **[dmuiX/fluxcd.k8sdev.cloud](https://github.com/dmuiX/fluxcd.k8sdev.cloud)** are two parts of the same cluster project:
+This repository and **[dmuiX/fluxcd.k8sdev.cloud](https://github.com/dmuiX/fluxcd.k8sdev.cloud)** were the two parts of the same former training cluster, now retained as references:
 
-- **Here — provisioning and bootstrap:** create the VMs, install Talos, initialize Kubernetes, and bring up the networking needed for GitOps.
-- **Companion repository — steady-state GitOps:** reconcile the cluster services and workloads after bootstrap, including the Longhorn and OpenBao dependencies expected by this script.
+- **Here — provisioning and bootstrap:** scripts for VM creation, Talos installation, Kubernetes initialization, and initial networking.
+- **Companion repository — historical GitOps configuration:** manifests for the former cluster's services and workloads, including the Longhorn and OpenBao dependencies expected by this script.
 
-> **Status: training project, not a production deployment.** I used this Talos setup for learning; my **k3s cluster has since replaced it** in my infrastructure. This repository is kept for reference, not as a currently running Talos platform or a freshly validated deployment guide. The tracked code contains environment-specific assumptions and unfinished paths. Review [configuration](#-configuration-reference), [safety notes](#-safety-and-cleanup), and [current limitations](#-current-limitations) before using it on an isolated lab host.
+> **Status: inactive training project, not a production deployment.** This Talos cluster and its companion Flux configuration are no longer active in my infrastructure; my **k3s cluster has replaced this setup**. Both repositories are kept **for reference only**, not as a currently running platform or a freshly validated deployment guide. The tracked code contains environment-specific assumptions and unfinished paths. Review [configuration](#-configuration-reference), [safety notes](#-safety-and-cleanup), and [current limitations](#-current-limitations) before using it on an isolated lab host.
 
 [Architecture](#-architecture-and-bootstrap-flow) · [Prerequisites](#-prerequisites) · [Preparation](#-preparation) · [Troubleshooting](#-troubleshooting) · [Reference notes](#-reference-notes)
 
